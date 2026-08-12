@@ -1,0 +1,1 @@
+import{$ as e,i as t}from"./Typography-De8E5tRw.js";function n(e){if(!e)return`—`;let t=e.replace(/T(\d{2})-(\d{2})-(\d{2})$/,`T$1:$2:$3`),n=new Date(t);return isNaN(n.getTime())?e:n.toLocaleDateString(`en-CA`)}var r=t((0,e().jsx)(`path`,{d:`M12 5.99 19.53 19H4.47zM12 2 1 21h22zm1 14h-2v2h2zm0-6h-2v4h2z`}),`WarningAmberOutlined`);export{n,r as t};
