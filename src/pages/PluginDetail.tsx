@@ -9,6 +9,7 @@ import ErrorBanner from '../components/common/ErrorBanner';
 import {
   PluginHeader,
   MigrationTimeline,
+  PluginCliSnippet,
   RecipeBreakdown,
   PRHistory,
   FailedMigrationsTable,
@@ -79,6 +80,7 @@ export default function PluginDetail() {
       {backButton}
       <PluginHeader plugin={plugin} />
       <MigrationTimeline migrations={plugin.migrations} />
+      <PluginCliSnippet pluginName={plugin.pluginName} migrations={plugin.migrations} />
       <RecipeBreakdown migrations={plugin.migrations} />
       <PRHistory migrations={plugin.migrations} />
       <FailedMigrationsTable migrations={plugin.migrations} />

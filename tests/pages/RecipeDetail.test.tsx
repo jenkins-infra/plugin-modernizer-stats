@@ -175,7 +175,7 @@ describe('RecipeDetail', () => {
       expect(screen.getByText(/Affected Plugins/)).toBeDefined();
     });
 
-    expect(screen.getByText('build-blocker-plugin')).toBeDefined();
+    expect(screen.getAllByText('build-blocker-plugin').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('syslog-logger').length).toBeGreaterThanOrEqual(1);
     console.log('  RecipeDetail : Affected Plugins table with real plugin names');
   });

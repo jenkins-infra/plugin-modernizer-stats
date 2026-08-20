@@ -15,6 +15,7 @@ import {
   RecipeTimeline,
   RecipePluginsTable,
   RecipeFailuresBreakdown,
+  RecipeCliSnippet,
 } from '../components/recipeDetail';
 import type { RecipeReport } from '../types';
 
@@ -210,6 +211,7 @@ export default function RecipeDetail() {
           <RecipeTimeline recipe={recipe} />
         </Box>
       </Box>
+      <RecipeCliSnippet recipe={recipe} />
       <RecipePluginsTable recipe={recipe} />
       <RecipeFailuresBreakdown recipe={recipe} />
     </Box>
