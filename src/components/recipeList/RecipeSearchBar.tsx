@@ -1,9 +1,9 @@
-import { Box, Typography, TextField, InputAdornment } from '@mui/material';
+import { Box, Typography, TextField, InputAdornment, IconButton } from '@mui/material';
 import { alpha } from '@mui/material/styles';
 import type { RateTier } from '../../util/recipeStatus';
 import { RATE_CARD_DEFS } from '../../util/recipeStatus';
 import { colors, rateTierColorMap } from '../../theme';
-import { SearchOutlined } from '@mui/icons-material';
+import { SearchOutlined, Clear as ClearIcon } from '@mui/icons-material';
 
 interface RecipeSearchBarProps {
   search: string;
@@ -34,6 +34,19 @@ export default function RecipeSearchBar({
                 <SearchOutlined sx={{ color: colors.text.muted, fontSize: 20 }} />
               </InputAdornment>
             ),
+            endAdornment: search ? (
+              <InputAdornment position="end">
+                <IconButton
+                  size="small"
+                  onClick={() => onSearchChange('')}
+                  aria-label="Clear search input"
+                  edge="end"
+                  sx={{ color: colors.text.muted, p: 0.5 }}
+                >
+                  <ClearIcon sx={{ fontSize: 16 }} />
+                </IconButton>
+              </InputAdornment>
+            ) : null,
           },
         }}
         sx={{

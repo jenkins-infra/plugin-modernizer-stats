@@ -78,4 +78,24 @@ describe('RecipeSearchBar', () => {
     expect(onClear).toHaveBeenCalled();
     console.log(`  RecipeSearchBar : clicking dismiss calls onClearFilter`);
   });
+
+  it('renders search clear button when search is non-empty and triggers onSearchChange("") when clicked', () => {
+    const onSearchChange = vi.fn();
+    render(
+      <RecipeSearchBar
+        search="Setup"
+        onSearchChange={onSearchChange}
+        tierFilter="all"
+        onClearFilter={() => {}}
+        resultCount={5}
+      />
+    );
+
+    const clearButton = screen.getByRole('button', { name: 'Clear search input' });
+    expect(clearButton).toBeDefined();
+
+    fireEvent.click(clearButton);
+    expect(onSearchChange).toHaveBeenCalledWith('');
+    console.log(`  RecipeSearchBar : clicking clear input button triggers onSearchChange("")`);
+  });
 });

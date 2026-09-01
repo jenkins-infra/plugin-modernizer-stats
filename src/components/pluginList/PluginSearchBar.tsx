@@ -2,7 +2,9 @@ import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import TextField from '@mui/material/TextField';
 import InputAdornment from '@mui/material/InputAdornment';
+import IconButton from '@mui/material/IconButton';
 import SearchIcon from '@mui/icons-material/Search';
+import ClearIcon from '@mui/icons-material/Clear';
 import { alpha } from '@mui/material/styles';
 import type { PluginStatusColor } from '../../types';
 import { colors, statusColorMap, STATUS_CARD_DEFS } from '../../theme';
@@ -36,6 +38,19 @@ export default function PluginSearchBar({
                 <SearchIcon sx={{ color: colors.text.muted, fontSize: 20 }} />
               </InputAdornment>
             ),
+            endAdornment: search ? (
+              <InputAdornment position="end">
+                <IconButton
+                  size="small"
+                  onClick={() => onSearchChange('')}
+                  aria-label="Clear search input"
+                  edge="end"
+                  sx={{ color: colors.text.muted, p: 0.5 }}
+                >
+                  <ClearIcon sx={{ fontSize: 16 }} />
+                </IconButton>
+              </InputAdornment>
+            ) : null,
           },
         }}
         sx={{
