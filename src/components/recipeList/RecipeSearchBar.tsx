@@ -39,6 +39,7 @@ export default function RecipeSearchBar({
                 <IconButton
                   size="small"
                   onClick={() => onSearchChange('')}
+                  onMouseDown={(e) => e.preventDefault()}
                   aria-label="Clear search input"
                   edge="end"
                   sx={{ color: colors.text.muted, p: 0.5 }}

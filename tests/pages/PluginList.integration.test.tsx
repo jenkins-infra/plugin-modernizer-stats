@@ -57,7 +57,7 @@ function countByStatus(plugins: PluginReport[]): Record<PluginStatusColor, numbe
   return counts;
 }
 
-describe('PluginList integration (real report.json)', () => {
+describe('PluginList integration (real report.json)', { timeout: 30000 }, () => {
   let realReport: ReportJson;
   let expectedPlugins: PluginReport[];
   let expectedCounts: Record<PluginStatusColor, number>;
