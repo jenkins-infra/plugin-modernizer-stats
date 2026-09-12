@@ -29,12 +29,12 @@ Totals for plugins, migrations, successes and failures, all taken straight from 
 
 ## Plugins
 
-The list shows every plugin with its migration record, searchable by name and filterable by four
-cards: _All Passed_, _All Failed_, _Mostly Passed_ and _Mostly Failed_. A plugin counts as mostly
-passed when under half its migrations failed, and mostly failed at half or more.
+The list covers plugins with at least one migration recorded, searchable by name and filterable by four
+cards. _All Passed_ and _All Failed_ mean exactly that. Plugins with mixed results are _Mostly Passed_
+when under half their migrations failed, and _Mostly Failed_ at half or more.
 
-A plugin whose migrations include one with no recorded outcome is shown as **Not Reported**, whatever
-its other migrations did.
+A plugin is shown as **Not Reported** if any one of its migrations has no recorded outcome, whatever the
+others did.
 
 Each plugin's own page adds a per-recipe breakdown, its pull requests, its failed migrations, the full
 migration history with diff sizes and CI results, and a copy-ready `plugin-modernizer` command. Note
