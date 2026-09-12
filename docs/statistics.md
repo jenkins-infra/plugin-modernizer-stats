@@ -4,9 +4,9 @@ What each page shows and how the numbers are worked out.
 
 ## Where the data comes from
 
-`npm run fetch-metadata` downloads one file, `report.json`, from
-<https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json> into `public/data/`. It is
-generated from the per-run records that the
+`npm run fetch-metadata` downloads one file,
+[`report.json`](https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json), into
+`public/data/`. It is generated from the per-run records that the
 [Plugin Modernizer tool](https://github.com/jenkinsci/plugin-modernizer-tool) pushes to
 [metadata-plugin-modernizer](https://github.com/jenkins-infra/metadata-plugin-modernizer). The site is
 static, so figures are as fresh as the last fetch — the dashboard shows the report's own timestamp.
