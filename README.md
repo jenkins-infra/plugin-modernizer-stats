@@ -10,6 +10,8 @@ The [Plugin modernizer tool](https://github.com/jenkinsci/plugin-modernizer-tool
 This static visualization site consumes this metadata and presents a dashboard with per-plugin and per-recipe reports.
 In short, the overall work done by plugin modernizer till now in form of UI.
 
+For what each page displays and how every figure is calculated, see [docs/statistics.md](docs/statistics.md).
+
 ## Getting Started
 
 ### Prerequisites
