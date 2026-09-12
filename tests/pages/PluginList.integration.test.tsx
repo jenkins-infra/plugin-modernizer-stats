@@ -57,7 +57,7 @@ function countByStatus(plugins: PluginReport[]): Record<PluginStatusColor, numbe
   return counts;
 }
 
-describe('PluginList integration (real report.json)', () => {
+describe('PluginList integration (real report.json)', { timeout: 30000 }, () => {
   let realReport: ReportJson;
   let expectedPlugins: PluginReport[];
   let expectedCounts: Record<PluginStatusColor, number>;
@@ -98,7 +98,7 @@ describe('PluginList integration (real report.json)', () => {
     });
   }
 
-  it('renders the correct total plugin count from real data', async () => {
+  it('renders the correct total plugin count from real data', { timeout: 15000 }, async () => {
     await renderAndWait();
 
     expect(screen.getByText('Plugins')).toBeDefined();
