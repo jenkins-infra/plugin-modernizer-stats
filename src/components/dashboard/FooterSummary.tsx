@@ -1,21 +1,31 @@
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import TrendingUpOutlined from '@mui/icons-material/TrendingUpOutlined';
+import type { ReportJson } from '../../types';
 import { colors } from '../../theme';
 
 interface FooterSummaryProps {
   successRate: string;
-  totalPlugins: number;
-  totalMigrations: number;
   recipesCount: number;
+  pullRequests?: ReportJson['pullRequests'];
 }
 
-export default function FooterSummary({
-  successRate,
-  totalPlugins,
-  totalMigrations,
-  recipesCount,
-}: FooterSummaryProps) {
+const Divider = () => (
+  <Box component="span" sx={{ color: colors.text.disabled, display: { xs: 'none', sm: 'inline' } }}>
+    |
+  </Box>
+);
+
+const Stat = ({ label, value, color }: { label: string; value: string | number; color: string }) => (
+  <Typography sx={{ color: colors.text.muted, fontSize: '0.875rem' }}>
+    {label}:{' '}
+    <Box component="span" sx={{ color, fontWeight: 700 }}>
+      {value}
+    </Box>
+  </Typography>
+);
+
+export default function FooterSummary({ successRate, recipesCount, pullRequests }: FooterSummaryProps) {
   return (
     <Box
       sx={{
@@ -48,33 +58,20 @@ export default function FooterSummary({
           {successRate}%
         </Box>
       </Typography>
-      <Box component="span" sx={{ color: colors.text.disabled, display: { xs: 'none', sm: 'inline' } }}>
-        |
-      </Box>
-      <Typography sx={{ color: colors.text.muted, fontSize: '0.875rem' }}>
-        Plugins:{' '}
-        <Box component="span" sx={{ color: colors.cyan.dark, fontWeight: 700 }}>
-          {totalPlugins}
-        </Box>
-      </Typography>
-      <Box component="span" sx={{ color: colors.text.disabled, display: { xs: 'none', sm: 'inline' } }}>
-        |
-      </Box>
-      <Typography sx={{ color: colors.text.muted, fontSize: '0.875rem' }}>
-        Migrations:{' '}
-        <Box component="span" sx={{ color: colors.orange.light, fontWeight: 700 }}>
-          {totalMigrations}
-        </Box>
-      </Typography>
-      <Box component="span" sx={{ color: colors.text.disabled, display: { xs: 'none', sm: 'inline' } }}>
-        |
-      </Box>
-      <Typography sx={{ color: colors.text.muted, fontSize: '0.875rem' }}>
-        Recipes:{' '}
-        <Box component="span" sx={{ color: colors.pink.dark, fontWeight: 700 }}>
-          {recipesCount}
-        </Box>
-      </Typography>
+      <Divider />
+      <Stat label="Recipes" value={recipesCount} color={colors.pink.dark} />
+      {pullRequests && (
+        <>
+          <Divider />
+          <Stat label="Pull requests" value={pullRequests.totalPRs} color={colors.primary.dark} />
+          <Divider />
+          <Stat label="Open" value={pullRequests.openPRs} color={colors.warning.dark} />
+          <Divider />
+          <Stat label="Merged" value={pullRequests.mergedPRs} color={colors.success.dark} />
+          <Divider />
+          <Stat label="Closed" value={pullRequests.closedPRs} color={colors.error.dark} />
+        </>
+      )}
     </Box>
   );
 }

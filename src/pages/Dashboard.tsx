@@ -223,12 +223,7 @@ export default function Dashboard() {
       <ChartsRow migrationStatusOption={migrationStatusOption} topRecipesOption={topRecipesOption} />
       <TimelineTags timelineOption={timelineOption} tagsOption={tagsOption} />
       <TopFailingRecipes recipes={topFailingRecipes} />
-      <FooterSummary
-        successRate={successRate}
-        totalPlugins={overview.totalPlugins}
-        totalMigrations={overview.totalMigrations}
-        recipesCount={recipesArray.length}
-      />
+      <FooterSummary successRate={successRate} recipesCount={recipesArray.length} pullRequests={data.pullRequests} />
     </Box>
   );
 }
