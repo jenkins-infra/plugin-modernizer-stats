@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { dataClient } from '../lib/dataClient';
-import type { AppData, PluginRecipesIndex, PluginReport, RecipeReport, Result } from '../types';
+import type { AppData, PluginRecipesIndex, PluginReport, RecipeReport, Result, SummaryJson } from '../types';
 
 interface HookState<T> {
   data: T | null;
@@ -150,6 +150,26 @@ export function useAllRecipes(): HookState<RecipeReport[]> {
   useEffect(() => {
     let cancelled = false;
     dataClient.getAllRecipes().then((r) => {
+      if (!cancelled) setState(settle(r));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return state;
+}
+
+export function useSummary(): HookState<SummaryJson> {
+  const [state, setState] = useState<HookState<SummaryJson>>({
+    data: null,
+    error: null,
+    loading: true,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    dataClient.getSummary().then((r) => {
       if (!cancelled) setState(settle(r));
     });
     return () => {
