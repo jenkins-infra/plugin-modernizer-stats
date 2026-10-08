@@ -3,14 +3,21 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from '../../src/pages/Dashboard';
-
+import { dataClient } from '../../src/lib/dataClient';
+import type { SummaryJson } from '../../src/types';
 vi.mock('echarts-for-react', () => ({
   default: (props: { option: Record<string, unknown> }) => (
     <div data-testid="echarts-mock" data-option={JSON.stringify(props.option)} />
   ),
 }));
 
-const mockReport = {
+vi.mock('../../src/lib/dataClient', () => ({
+  dataClient: {
+    getSummary: vi.fn(),
+  },
+}));
+
+const mockSummary: SummaryJson = {
   schemaVersion: '1.0.0',
   generatedAt: '2026-08-03T04:34:07Z',
   dataSource: 'https://github.com/jenkins-infra/metadata-plugin-modernizer',
@@ -42,23 +49,20 @@ const mockReport = {
     { tag: 'dependencies', count: 467 },
     { tag: 'migration', count: 298 },
   ],
-  recipes: {
-    'io.jenkins.tools.pluginmodernizer.SetupJenkinsfile': {
+  recipes: [
+    {
       recipeId: 'io.jenkins.tools.pluginmodernizer.SetupJenkinsfile',
-      totalApplications: 624,
-      successCount: 102,
-      failureCount: 522,
-      plugins: [],
+      total: 624,
+      success: 102,
+      fail: 522,
     },
-    'io.jenkins.tools.pluginmodernizer.AddCodeOwner': {
+    {
       recipeId: 'io.jenkins.tools.pluginmodernizer.AddCodeOwner',
-      totalApplications: 13,
-      successCount: 11,
-      failureCount: 1,
-      plugins: [],
+      total: 13,
+      success: 11,
+      fail: 1,
     },
-  },
-  plugins: {},
+  ],
 };
 
 function renderDashboard() {
@@ -70,22 +74,16 @@ function renderDashboard() {
 }
 
 beforeEach(() => {
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve(mockReport) }))
-  );
+  vi.mocked(dataClient.getSummary).mockResolvedValue({ ok: true, data: mockSummary });
 });
 
 afterEach(() => {
-  vi.restoreAllMocks();
+  vi.clearAllMocks();
 });
 
 describe('Dashboard', () => {
   it('shows skeleton while loading', () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(() => new Promise(() => {}))
-    );
+    vi.mocked(dataClient.getSummary).mockImplementation(() => new Promise(() => {}));
 
     renderDashboard();
 
@@ -125,15 +123,11 @@ describe('Dashboard', () => {
   });
 
   it('omits the pull request stats when the report has no pullRequests block', async () => {
-    const { pullRequests, ...withoutPRs } = mockReport;
+    const { pullRequests, ...withoutPRs } = mockSummary;
     void pullRequests;
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve(withoutPRs) }))
-    );
 
+    vi.mocked(dataClient.getSummary).mockResolvedValue({ ok: true, data: withoutPRs as SummaryJson });
     renderDashboard();
-
     await waitFor(() => {
       expect(screen.getByText('Total Plugins')).toBeDefined();
     });
@@ -147,8 +141,10 @@ describe('Dashboard', () => {
     await waitFor(() => {
       expect(screen.getByText('Total Plugins')).toBeDefined();
     });
+
     expect(screen.queryByText(/^Plugins:/)).toBeNull();
     expect(screen.queryByText(/^Migrations:/)).toBeNull();
+
     console.log('  Dashboard : footer no longer duplicates the plugin and migration stat cards');
   });
 
@@ -176,10 +172,7 @@ describe('Dashboard', () => {
   });
 
   it('shows error state on fetch failure', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(() => Promise.resolve({ ok: false, status: 500, statusText: 'Internal Server Error' }))
-    );
+    vi.mocked(dataClient.getSummary).mockResolvedValue({ ok: false, error: 'HTTP 500: Internal Server Error' });
 
     renderDashboard();
 
@@ -192,10 +185,10 @@ describe('Dashboard', () => {
   });
 
   it('shows error state on network error', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(() => Promise.reject(new Error('Failed to fetch')))
-    );
+    vi.mocked(dataClient.getSummary).mockResolvedValue({
+      ok: false,
+      error: 'Failed to fetch',
+    });
 
     renderDashboard();
 

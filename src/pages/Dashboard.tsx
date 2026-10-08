@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo, useCallback, useReducer } from 'react';
 import Box from '@mui/material/Box';
 import Skeleton from '@mui/material/Skeleton';
-import type { ReportJson, RecipeReport, RecipeStats } from '../types';
+import type { SummaryJson, RecipeStats } from '../types';
+import { dataClient } from '../lib/dataClient';
 import { colors } from '../theme';
 import ErrorBanner from '../components/common/ErrorBanner';
 import {
@@ -15,22 +16,32 @@ import {
 
 export default function Dashboard() {
   const [, retry] = useReducer((x: number) => x + 1, 0);
-  const [data, setData] = useState<ReportJson | null>(null);
+  const [data, setData] = useState<SummaryJson | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
       try {
-        const res = await fetch(`${import.meta.env.BASE_URL}data/report.json`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-        const json: ReportJson = await res.json();
-        if (!cancelled) setData(json);
+        const result = await dataClient.getSummary();
+
+        if (!result.ok) {
+          throw new Error(result.error);
+        }
+
+        if (!cancelled) {
+          setData(result.data);
+        }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load data');
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : 'Failed to load data');
+        }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     }
     load();
@@ -41,20 +52,7 @@ export default function Dashboard() {
 
   const overview = data?.overview ?? null;
   const successRate = overview ? overview.successRate.toFixed(1) : '0';
-
-  const recipesArray: RecipeReport[] = useMemo(() => {
-    if (!data?.recipes) return [];
-    return Object.values(data.recipes);
-  }, [data]);
-
-  const recipesStats: RecipeStats[] = useMemo(() => {
-    return recipesArray.map((r) => ({
-      recipeId: r.recipeId,
-      total: r.totalApplications,
-      success: r.successCount,
-      fail: r.failureCount,
-    }));
-  }, [recipesArray]);
+  const recipesStats: RecipeStats[] = data?.recipes ?? [];
 
   const handleRetry = useCallback(() => {
     retry();
@@ -172,13 +170,15 @@ export default function Dashboard() {
 
   const topFailingRecipes = useMemo(() => {
     if (!data?.failuresByRecipe || !data?.recipes) return [];
+
     return data.failuresByRecipe.slice(0, 8).map((entry) => {
-      const recipe = data.recipes[entry.recipeId];
+      const recipe = data.recipes.find((r) => r.recipeId === entry.recipeId);
+
       return {
         recipeId: entry.recipeId,
         failures: entry.failures,
-        successCount: recipe?.successCount ?? 0,
-        failureCount: recipe?.failureCount ?? entry.failures,
+        successCount: recipe?.success ?? 0,
+        failureCount: recipe?.fail ?? entry.failures,
       };
     });
   }, [data]);
@@ -223,7 +223,7 @@ export default function Dashboard() {
       <ChartsRow migrationStatusOption={migrationStatusOption} topRecipesOption={topRecipesOption} />
       <TimelineTags timelineOption={timelineOption} tagsOption={tagsOption} />
       <TopFailingRecipes recipes={topFailingRecipes} />
-      <FooterSummary successRate={successRate} recipesCount={recipesArray.length} pullRequests={data.pullRequests} />
+      <FooterSummary successRate={successRate} recipesCount={recipesStats.length} pullRequests={data.pullRequests} />
     </Box>
   );
 }
