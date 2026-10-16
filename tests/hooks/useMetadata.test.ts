@@ -22,6 +22,7 @@ import {
   useRecipeData,
   useAllPlugins,
   useAllRecipes,
+  useSummary,
   useAppData,
 } from '../../src/hooks/useMetadata';
 
@@ -212,6 +213,33 @@ describe('useAllRecipes', () => {
     expect(result.current.data?.[0].recipeId).toContain('SetupJenkinsfile');
     console.log(`  mock data    : 1 recipe`);
     console.log(`  useAllRecipes: ${result.current.data?.length} recipes`);
+  });
+});
+
+describe('useSummary', () => {
+  it('returns summary data on success', async () => {
+    mockClient.getSummary.mockResolvedValue({ ok: true, data: mockSummary });
+
+    const { result } = renderHook(() => useSummary());
+
+    expect(result.current.loading).toBe(true);
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.data).toEqual(mockSummary);
+    expect(result.current.error).toBeNull();
+    console.log(`  useSummary : ${result.current.data?.overview.totalMigrations} migrations`);
+  });
+
+  it('returns error on failure', async () => {
+    mockClient.getSummary.mockResolvedValue({ ok: false, error: 'Request timed out after 10000ms' });
+
+    const { result } = renderHook(() => useSummary());
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.data).toBeNull();
+    expect(result.current.error).toBe('Request timed out after 10000ms');
+    console.log(`  useSummary : error="${result.current.error}"`);
   });
 });
 
