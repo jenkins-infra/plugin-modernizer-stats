@@ -9,7 +9,7 @@
   "scripts": {
     "fetch-metadata": "node scripts/fetch-metadata.js",
     "dev": "vite",
-    "build": "tsc -b && vite build && cp dist/index.html dist/404.html",
+    "build": "tsc -b && vite build && node scripts/copy-404.js",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
