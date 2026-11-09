@@ -1,0 +1,778 @@
+name: Deploy PR Preview
+
+on:
+  workflow_run:
+    # Listen to the CI workflow by its exact name as declared in ci.yml.
+    workflows: ['CI']
+    types: [completed]
+
+# Least-privilege permissions.  contents:write is required only by the
+# JamesIves deploy action and the cleanup git step.  pull-requests:write is
+# required only for the PR comment step.  actions:read is required to download
+# artifacts from the triggering workflow run.
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # All preview deployments and cleanups modify the shared gh-pages branch.
+  # A single repository-wide concurrency group serializes all gh-pages operations
+  # without rebase push conflicts.
+  #
+  # queue: max queues waiting runs instead of dropping or replacing intermediate runs.
+  # Note: GitHub queue ordering is based on when runs start waiting, and strict arrival
+  # ordering is not guaranteed by the platform.
+  # Therefore, every run independently verifies live PR state, head SHA, and identity
+  # via the GitHub API before deployment or directory removal. If a PR has already closed,
+  # any delayed or out-of-order deploy run is rejected at Step 5 and cannot recreate the preview.
+  group: pr-preview-gh-pages
+  queue: max
+
+jobs:
+  deploy-preview:
+    # Pre-flight guards evaluated before the job allocates a runner:
+    #   1. The upstream CI workflow run must have completed successfully, unless
+    #      the run is for a closed PR (cleanup must proceed even when build failed).
+    #      We cannot distinguish closed-PR runs here before reading metadata, so we
+    #      allow any conclusion and perform the conclusion check inside the job after
+    #      reading pr-action.
+    #   2. The event that triggered CI must be pull_request (not push or
+    #      workflow_dispatch), which is the only event that produces pr-metadata.
+    #   3. The triggering workflow must be 'CI' originating from this repository.
+    #      (Exact workflow ID and canonical path are asserted in Step 5).
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.name == 'CI' &&
+      github.event.workflow_run.repository.full_name == github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Artifact download ───────────────────────────────────────────────
+      # Download artifacts from the exact triggering workflow run, identified by
+      # run_id.  Using the run_id from the event payload prevents any ambiguity
+      # about which run produced the artifacts.
+      - name: Download artifacts from triggering run
+        id: download
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = context.payload.workflow_run.id;
+            console.log(`Triggering run id: ${runId}`);
+
+            const { data: { artifacts } } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+
+            const names = artifacts.map(a => a.name);
+            console.log(`Artifacts found: ${names.join(', ') || '(none)'}`);
+
+            // pr-metadata is mandatory for every code path.
+            const metaArtifact = artifacts.find(a => a.name === 'pr-metadata');
+            if (!metaArtifact) {
+              core.setFailed(
+                `Required artifact 'pr-metadata' not found in run ${runId}. ` +
+                `Available: ${names.join(', ') || '(none)'}`
+              );
+              return;
+            }
+
+            const fs = require('fs');
+            const path = require('path');
+            const ws = process.env.GITHUB_WORKSPACE;
+
+            // Download pr-metadata (always required).
+            const metaDownload = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: metaArtifact.id,
+              archive_format: 'zip',
+            });
+            fs.writeFileSync(path.join(ws, 'pr-metadata.zip'), Buffer.from(metaDownload.data));
+            console.log('Downloaded pr-metadata.zip');
+
+            // pr-preview-build is optional; absent for cleanup runs.
+            const buildArtifact = artifacts.find(a => a.name === 'pr-preview-build');
+            if (buildArtifact) {
+              const buildDownload = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: buildArtifact.id,
+                archive_format: 'zip',
+              });
+              fs.writeFileSync(path.join(ws, 'pr-preview-build.zip'), Buffer.from(buildDownload.data));
+              console.log('Downloaded pr-preview-build.zip');
+            } else {
+              console.log("Artifact 'pr-preview-build' not found (expected for cleanup runs).");
+            }
+
+      # ── 2. Validate and extract artifacts ─────────────────────────────────
+      # Both ZIPs are treated as UNTRUSTED data.
+      # No scripts or binaries from the downloaded artifacts are ever executed.
+      #
+      # ZIP validation happens BEFORE extraction using Python's zipfile module,
+      # which reads the central directory without writing any files.  Extraction
+      # is refused if any entry has an absolute path, a '..' traversal component,
+      # a backslash separator (Windows-style traversal), or a null byte.
+      # This prevents path traversal writes regardless of the unzip implementation.
+      #
+      # Metadata ZIP additionally uses -j (junk paths) as a defence-in-depth
+      # measure: even if a future validation gap were missed, strip-then-write
+      # cannot escape the target directory.
+      - name: Validate and extract artifacts
+        run: |
+          # ── Validate metadata ZIP entries before extraction ────────────────
+          python3 - <<'PYEOF'
+          import zipfile, sys, stat
+
+          ZIPNAME = 'pr-metadata.zip'
+          with zipfile.ZipFile(ZIPNAME) as zf:
+              for info in zf.infolist():
+                  name = info.filename
+                  if name.startswith('/') or name.startswith('\\'):
+                      print(f'::error::Absolute path in {ZIPNAME}: {name}')
+                      sys.exit(1)
+                  if '\x00' in name:
+                      print(f'::error::Null byte in {ZIPNAME} entry name')
+                      sys.exit(1)
+                  parts = name.replace('\\', '/').split('/')
+                  if '..' in parts:
+                      print(f'::error::Path traversal in {ZIPNAME}: {name}')
+                      sys.exit(1)
+                  # Reject symlinks, device nodes, and other special file types.
+                  # Upper 16 bits of external_attr contain Unix file mode.
+                  # 0 means no Unix attrs recorded (e.g. Windows-created ZIP).
+                  mode = info.external_attr >> 16
+                  if mode != 0:
+                      if stat.S_ISLNK(mode):
+                          print(f'::error::Symlink entry in {ZIPNAME}: {name}')
+                          sys.exit(1)
+                      if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                          print(f'::error::Special file entry in {ZIPNAME}: {name} (mode=0o{mode:o})')
+                          sys.exit(1)
+          print(f'{ZIPNAME} entries validated.')
+          PYEOF
+
+          mkdir -p pr-metadata
+          # -j: junk paths (defence in depth even after validation).
+          # -o: overwrite without prompting.
+          unzip -jo pr-metadata.zip -d pr-metadata
+
+          # ── Validate build ZIP entries before extraction (if present) ──────
+          if [ -f pr-preview-build.zip ]; then
+            python3 - <<'PYEOF'
+          import zipfile, sys, stat
+
+          ZIPNAME = 'pr-preview-build.zip'
+          with zipfile.ZipFile(ZIPNAME) as zf:
+              for info in zf.infolist():
+                  name = info.filename
+                  if name.startswith('/') or name.startswith('\\'):
+                      print(f'::error::Absolute path in {ZIPNAME}: {name}')
+                      sys.exit(1)
+                  if '\x00' in name:
+                      print(f'::error::Null byte in {ZIPNAME} entry name')
+                      sys.exit(1)
+                  parts = name.replace('\\', '/').split('/')
+                  if '..' in parts:
+                      print(f'::error::Path traversal in {ZIPNAME}: {name}')
+                      sys.exit(1)
+                  # Reject symlinks, device nodes, and other special file types.
+                  mode = info.external_attr >> 16
+                  if mode != 0:
+                      if stat.S_ISLNK(mode):
+                          print(f'::error::Symlink entry in {ZIPNAME}: {name}')
+                          sys.exit(1)
+                      if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                          print(f'::error::Special file entry in {ZIPNAME}: {name} (mode=0o{mode:o})')
+                          sys.exit(1)
+          print(f'{ZIPNAME} entries validated.')
+          PYEOF
+
+            mkdir -p dist
+            # -o: overwrite; paths are preserved because the site has real subdirs.
+            # Pre-extraction validation above has already rejected traversal entries.
+            unzip -o pr-preview-build.zip -d dist
+            echo "Build artifact extracted."
+          fi
+
+      # ── 3. Read and validate PR metadata ──────────────────────────────────
+      - name: Read and validate PR metadata
+        id: meta
+        run: |
+          # --- Read raw values ---
+          PR_NUMBER="$(cat pr-metadata/pr-number)"
+          PR_ACTION="$(cat pr-metadata/pr-action)"
+          PR_HEAD_SHA="$(cat pr-metadata/pr-head-sha)"
+          PR_HEAD_REF="$(cat pr-metadata/pr-head-ref)"
+          PR_HEAD_REPO="$(cat pr-metadata/pr-head-repo)"
+          PR_BASE_REPO="$(cat pr-metadata/pr-base-repo)"
+          PR_BASE_REF="$(cat pr-metadata/pr-base-ref)"
+
+          echo "Raw metadata:"
+          echo "  pr-number:   $PR_NUMBER"
+          echo "  pr-action:   $PR_ACTION"
+          echo "  pr-head-sha: $PR_HEAD_SHA"
+          echo "  pr-head-ref: $PR_HEAD_REF"
+          echo "  pr-head-repo: $PR_HEAD_REPO"
+          echo "  pr-base-repo: $PR_BASE_REPO"
+          echo "  pr-base-ref: $PR_BASE_REF"
+
+          # --- Validate pr-number: digits only, 1–6 characters ---
+          if ! echo "$PR_NUMBER" | grep -qE '^[0-9]{1,6}$'; then
+            echo "::error::Invalid pr-number: '$PR_NUMBER'"
+            exit 1
+          fi
+
+          # --- Validate pr-action: exactly 'deploy' or 'closed' ---
+          if [ "$PR_ACTION" != 'deploy' ] && [ "$PR_ACTION" != 'closed' ]; then
+            echo "::error::Invalid pr-action: '$PR_ACTION'"
+            exit 1
+          fi
+
+          # --- Validate pr-head-sha: exactly 40 lowercase hex characters ---
+          if ! echo "$PR_HEAD_SHA" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::Invalid pr-head-sha: '$PR_HEAD_SHA'"
+            exit 1
+          fi
+
+          # --- Validate pr-head-ref: no path separators or shell metacharacters ---
+          if ! echo "$PR_HEAD_REF" | grep -qE '^[A-Za-z0-9_.\/-]{1,255}$'; then
+            echo "::error::Invalid pr-head-ref: '$PR_HEAD_REF'"
+            exit 1
+          fi
+
+          # --- Validate pr-head-repo and pr-base-repo: owner/repo format ---
+          # For deploy events, pr-head-repo is strictly required to be owner/repo.
+          # For closed cleanup events, pr-head-repo may be empty if the source
+          # fork was deleted before/upon PR close. If non-empty, it must match owner/repo.
+          if [ "$PR_ACTION" = 'deploy' ]; then
+            if ! echo "$PR_HEAD_REPO" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+              echo "::error::Invalid pr-head-repo for deploy: '$PR_HEAD_REPO'"
+              exit 1
+            fi
+          else
+            if [ -n "$PR_HEAD_REPO" ] && ! echo "$PR_HEAD_REPO" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+              echo "::error::Invalid non-empty pr-head-repo for closed: '$PR_HEAD_REPO'"
+              exit 1
+            fi
+          fi
+          if ! echo "$PR_BASE_REPO" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::Invalid pr-base-repo: '$PR_BASE_REPO'"
+            exit 1
+          fi
+
+          # --- Validate pr-base-ref: same character class as pr-head-ref ---
+          if ! echo "$PR_BASE_REF" | grep -qE '^[A-Za-z0-9_.\/-]{1,255}$'; then
+            echo "::error::Invalid pr-base-ref: '$PR_BASE_REF'"
+            exit 1
+          fi
+
+          # --- Write validated values to GITHUB_OUTPUT ---
+          {
+            printf 'pr_number=%s\n' "$PR_NUMBER"
+            printf 'pr_action=%s\n' "$PR_ACTION"
+            printf 'pr_head_sha=%s\n' "$PR_HEAD_SHA"
+            printf 'pr_head_ref=%s\n' "$PR_HEAD_REF"
+            printf 'pr_head_repo=%s\n' "$PR_HEAD_REPO"
+            printf 'pr_base_repo=%s\n' "$PR_BASE_REPO"
+            printf 'pr_base_ref=%s\n' "$PR_BASE_REF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Validation passed."
+
+      # ── 4. Abort if CI failed and this is a deploy run ────────────────────
+      # Cleanup runs must proceed even after a failed CI build.
+      # Deploy runs must not deploy artifacts from a failed build.
+      - name: Check CI conclusion for deploy runs
+        if: steps.meta.outputs.pr_action == 'deploy'
+        run: |
+          CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+          if [ "$CONCLUSION" != 'success' ]; then
+            echo "::notice::CI conclusion is '$CONCLUSION'; skipping deploy."
+            exit 1
+          fi
+
+      # ── 5. Verify PR identity via GitHub API ──────────────────────────────
+      # Security model:
+      #   The artifact's pr-number is UNTRUSTED (written by PR-controlled CI code).
+      #   We establish the true PR number independently from the workflow_run event
+      #   (GitHub-infrastructure controlled) BEFORE accepting the artifact's claim.
+      #
+      # SHA semantics (confirmed via GitHub REST API docs and multiple sources):
+      #   github.event.workflow_run.head_sha = the PR TIP SHA (developer's commit).
+      #   github.sha inside a pull_request workflow = the MERGE COMMIT SHA (refs/pull/N/merge).
+      #   These are DIFFERENT contexts: workflow_run.head_sha records the head commit
+      #   of the branch that triggered the upstream run, which for pull_request events
+      #   is the PR tip commit — NOT the temporary merge ref.
+      #   workflow_run.head_sha CAN and SHOULD be compared against p.head.sha from
+      #   the pulls API and pull_requests[] array, because both are PR tip SHAs.
+      #
+      # Strategy:
+      #   Path 1 (same-repo PR): workflow_run.pull_requests[] is populated by GitHub.
+      #     Filter on base.repo.url, head.ref, AND head.sha matching workflow_run
+      #     fields.  All are PR tip values.  Fail if zero or >1 matches (ambiguous).
+      #
+      #   Path 2 (fork PR, including fork-of-fork): pull_requests[] is empty.
+      #     Use pulls.list(head: 'owner:branch') where owner comes from
+      #     workflow_run.head_repository.full_name and branch from head_branch.
+      #     The 'owner:branch' format is documented; 'owner/repo:branch' is NOT.
+      #     Further filter on p.base.repo.full_name == this repo AND
+      #     p.head.sha == wrHeadSha (both are PR tip SHAs) AND
+      #     (p.head.repo?.full_name == wrHeadRepoFullName OR p.head.repo == null).
+      #     Fail if zero or >1 matches.
+      #
+      #   Step B: artifact pr-number must equal the authoritatively determined number.
+      #
+      #   Step C: live API cross-check of all fields, state, and (for deploy only)
+      #     pr.head.sha vs artifact head sha — both are PR tip SHAs, so this is valid.
+      #
+      # Deleted fork (pr.head.repo == null):
+      #   Deploy: rejected (cannot verify source identity).
+      #   Cleanup: allowed; identity is established via authoritative PR number and
+      #     base repo validation, which do not require the fork repo to still exist.
+      - name: Verify PR identity and freshness via GitHub API
+        id: verify
+        uses: actions/github-script@v7
+        env:
+          META_PR_NUMBER:    ${{ steps.meta.outputs.pr_number }}
+          META_PR_ACTION:    ${{ steps.meta.outputs.pr_action }}
+          META_PR_HEAD_SHA:  ${{ steps.meta.outputs.pr_head_sha }}
+          META_PR_HEAD_REF:  ${{ steps.meta.outputs.pr_head_ref }}
+          META_PR_HEAD_REPO: ${{ steps.meta.outputs.pr_head_repo }}
+          META_PR_BASE_REPO: ${{ steps.meta.outputs.pr_base_repo }}
+          META_PR_BASE_REF:  ${{ steps.meta.outputs.pr_base_ref }}
+          # WR_HEAD_BRANCH, WR_HEAD_REPO, and WR_HEAD_SHA come from the workflow_run
+          # event payload, which GitHub infrastructure sets — not from the PR author.
+          # WR_HEAD_SHA is the PR TIP SHA (the developer's commit on the PR branch),
+          # NOT the merge commit.  It is used for SHA-based identity verification in
+          # both Path 1 and Path 2.
+          WR_HEAD_SHA:    ${{ github.event.workflow_run.head_sha }}
+          WR_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_HEAD_REPO:   ${{ github.event.workflow_run.head_repository.full_name }}
+        with:
+          script: |
+            const expectedRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const wr = context.payload.workflow_run;
+
+            // ── Step 0: verify workflow run identity ──────────────────────────
+            if (wr.repository.full_name !== expectedRepo) {
+              core.setFailed(`Workflow run repository mismatch: '${wr.repository.full_name}' ≠ '${expectedRepo}'`);
+              return;
+            }
+
+            let ciWorkflow;
+            try {
+              ciWorkflow = await github.rest.actions.getWorkflow({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'ci.yml',
+              });
+            } catch (err) {
+              core.setFailed(`Failed to fetch canonical CI workflow 'ci.yml': ${err.message}`);
+              return;
+            }
+
+            if (ciWorkflow.data.path !== '.github/workflows/ci.yml') {
+              core.setFailed(`Canonical workflow path mismatch: '${ciWorkflow.data.path}' ≠ '.github/workflows/ci.yml'`);
+              return;
+            }
+            if (wr.workflow_id !== ciWorkflow.data.id) {
+              core.setFailed(`Workflow ID mismatch: run has ${wr.workflow_id}, ci.yml has ${ciWorkflow.data.id}`);
+              return;
+            }
+
+            // ── Validate artifact PR number as positive integer ───────────────
+            const rawPrNumber = process.env.META_PR_NUMBER;
+            const artifactPrNumber = parseInt(rawPrNumber, 10);
+            if (!Number.isInteger(artifactPrNumber) || artifactPrNumber <= 0 || String(artifactPrNumber) !== rawPrNumber) {
+              core.setFailed(`Invalid artifact PR number: '${rawPrNumber}'`);
+              return;
+            }
+
+            const prAction         = process.env.META_PR_ACTION;
+            const artifactSha      = process.env.META_PR_HEAD_SHA;
+            const artifactRef      = process.env.META_PR_HEAD_REF;
+            const artifactHeadRepo = process.env.META_PR_HEAD_REPO;
+            const artifactBaseRepo = process.env.META_PR_BASE_REPO;
+            const artifactBaseRef  = process.env.META_PR_BASE_REF;
+
+            // workflow_run event fields (GitHub-controlled, not PR-author-controlled).
+            const wrHeadSha    = process.env.WR_HEAD_SHA;    // PR tip SHA (NOT merge commit)
+            const wrHeadBranch = process.env.WR_HEAD_BRANCH; // PR tip branch name
+            const wrHeadRepo   = process.env.WR_HEAD_REPO;   // fork full_name or '' if deleted
+
+            console.log(`workflow_run: head_sha(tip)=${wrHeadSha} branch=${wrHeadBranch} repo=${wrHeadRepo}`);
+
+            // ── Step A: establish authoritative PR number ──────────────────────
+            // workflow_run.head_sha IS the PR tip SHA (confirmed via GitHub REST API docs).
+            // It equals github.event.pull_request.head.sha from the triggering CI run.
+            // We use it for SHA-based PR identity verification in both lookup paths.
+            let authoritativePrNumber = null;
+
+            // Path 1: same-repo PR — workflow_run.pull_requests[] is populated by GitHub.
+            const wrPrs = context.payload.workflow_run.pull_requests || [];
+            if (wrPrs.length > 0) {
+              const thisRepoSuffix = `/${expectedRepo}`;
+              const matching = wrPrs.filter(p =>
+                p.base && p.base.repo &&
+                (p.base.repo.full_name === expectedRepo || (p.base.repo.url && p.base.repo.url.endsWith(thisRepoSuffix))) &&
+                p.head && p.head.ref === wrHeadBranch &&
+                p.head.sha === wrHeadSha
+              );
+              if (matching.length === 1) {
+                authoritativePrNumber = matching[0].number;
+                console.log(`Path 1: authoritative PR #${authoritativePrNumber} from workflow_run.pull_requests.`);
+              } else if (matching.length === 0) {
+                console.log(`Path 1: pull_requests[] has ${wrPrs.length} entries but none match this run. Trying Path 2.`);
+              } else {
+                core.setFailed(
+                  `Ambiguous: ${matching.length} entries in workflow_run.pull_requests[] match head SHA and branch. ` +
+                  `Cannot safely determine PR identity.`
+                );
+                return;
+              }
+            }
+
+            // Path 2: fork PR with non-empty wrHeadRepo.
+            // Uses pulls.list with 'owner:branch' format with full pagination.
+            if (authoritativePrNumber === null && wrHeadRepo) {
+              const wrHeadOwner = wrHeadRepo.split('/')[0];
+              let listResp;
+              try {
+                listResp = await github.paginate(github.rest.pulls.list, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  head: `${wrHeadOwner}:${wrHeadBranch}`,
+                  state: 'all',
+                  per_page: 100,
+                });
+              } catch (err) {
+                console.log(`Path 2 pulls.list query failed: ${err.message}`);
+                listResp = [];
+              }
+
+              const candidates = (listResp || []).filter(p => {
+                if (!p.base || !p.base.repo || p.base.repo.full_name !== expectedRepo) return false;
+                if (p.head.sha !== wrHeadSha) return false;
+                if (p.head.ref !== wrHeadBranch) return false;
+                if (p.head.repo === null) {
+                  return true;
+                }
+                return p.head.repo.full_name === wrHeadRepo;
+              });
+
+              if (candidates.length === 1) {
+                authoritativePrNumber = candidates[0].number;
+                console.log(`Path 2: authoritative PR #${authoritativePrNumber} from pulls.list.`);
+              } else if (candidates.length > 1) {
+                core.setFailed(
+                  `Path 2: ambiguous — ${candidates.length} PRs match ` +
+                  `${wrHeadOwner}:${wrHeadBranch} targeting ${expectedRepo}.`
+                );
+                return;
+              }
+            }
+
+            // Deleted-Fork Fallback (Path 1 and Path 2 yielded no match).
+            // Allowed ONLY for closed cleanup runs. Never trust artifactPrNumber alone:
+            // paginate all closed PRs, filter by trusted wrHeadSha + wrHeadBranch + base repo,
+            // require exactly one candidate, and assert its number equals artifactPrNumber.
+            if (authoritativePrNumber === null) {
+              if (prAction !== 'closed') {
+                core.setFailed(
+                  `Cannot establish PR identity for deploy run: ` +
+                  `workflow_run.head_repository is '${wrHeadRepo || '(empty)'}'. Failing closed.`
+                );
+                return;
+              }
+
+              console.log('Path 1 and Path 2 did not match; activating deleted-fork cleanup fallback.');
+              let closedPrs;
+              try {
+                closedPrs = await github.paginate(github.rest.pulls.list, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'closed',
+                  per_page: 100,
+                });
+              } catch (err) {
+                core.setFailed(`Failed to paginate closed PRs: ${err.message}`);
+                return;
+              }
+
+              const closedCandidates = (closedPrs || []).filter(p =>
+                p.base && p.base.repo && p.base.repo.full_name === expectedRepo &&
+                p.head && p.head.ref === wrHeadBranch &&
+                p.head.sha === wrHeadSha &&
+                p.head.repo === null
+              );
+
+              if (closedCandidates.length === 0) {
+                core.setFailed(
+                  `Deleted-fork cleanup: no closed PR found targeting ${expectedRepo} with ` +
+                  `head ref '${wrHeadBranch}' and SHA '${wrHeadSha}'. Failing closed.`
+                );
+                return;
+              }
+              if (closedCandidates.length > 1) {
+                core.setFailed(
+                  `Deleted-fork cleanup: ambiguous — ${closedCandidates.length} closed PRs match ` +
+                  `head ref '${wrHeadBranch}' and SHA '${wrHeadSha}'. Cannot prove identity uniquely. Failing closed.`
+                );
+                return;
+              }
+
+              const matchedPr = closedCandidates[0];
+              if (matchedPr.number !== artifactPrNumber) {
+                core.setFailed(
+                  `Deleted-fork cleanup: trusted search found PR #${matchedPr.number}, ` +
+                  `but artifact claims PR #${artifactPrNumber}. Rejecting.`
+                );
+                return;
+              }
+
+              authoritativePrNumber = matchedPr.number;
+              console.log(`Deleted-fork fallback: uniquely verified PR #${authoritativePrNumber}.`);
+            }
+
+            // ── Step B: artifact pr-number must equal authoritative number ────
+            if (artifactPrNumber !== authoritativePrNumber) {
+              core.setFailed(
+                `PR number mismatch: artifact claims #${artifactPrNumber} but ` +
+                `workflow_run event identifies PR #${authoritativePrNumber}. Rejecting.`
+              );
+              return;
+            }
+
+            // ── Step C: fetch live PR and cross-check all fields ──────────────
+            let pr;
+            try {
+              const resp = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: authoritativePrNumber,
+              });
+              pr = resp.data;
+            } catch (err) {
+              core.setFailed(`pulls.get for PR #${authoritativePrNumber} failed: ${err.message}`);
+              return;
+            }
+
+            console.log(`Live PR #${authoritativePrNumber}: state=${pr.state}, head.sha=${pr.head.sha}`);
+
+            // Base repository check
+            if (!pr.base || !pr.base.repo || pr.base.repo.full_name !== expectedRepo) {
+              core.setFailed(`Base repo mismatch: live '${pr.base && pr.base.repo && pr.base.repo.full_name}' ≠ '${expectedRepo}'`);
+              return;
+            }
+            if (pr.base.ref !== artifactBaseRef) {
+              core.setFailed(`Base ref mismatch: artifact '${artifactBaseRef}' vs live '${pr.base.ref}'.`);
+              return;
+            }
+
+            // Head ref check: must match both artifact and trusted workflow_run
+            if (pr.head.ref !== artifactRef || pr.head.ref !== wrHeadBranch) {
+              core.setFailed(`Head ref mismatch: live '${pr.head.ref}', artifact '${artifactRef}', wr '${wrHeadBranch}'.`);
+              return;
+            }
+
+            // Head SHA check: must match both artifact SHA and trusted workflow_run SHA
+            if (!pr.head.sha) {
+              core.setFailed(`PR #${authoritativePrNumber} head SHA is missing or unavailable from GitHub API. Failing closed.`);
+              return;
+            }
+            if (pr.head.sha !== wrHeadSha) {
+              core.setFailed(`Head SHA mismatch: live PR SHA '${pr.head.sha}' ≠ workflow_run SHA '${wrHeadSha}'.`);
+              return;
+            }
+            if (pr.head.sha !== artifactSha) {
+              core.setFailed(`Head SHA mismatch: live PR SHA '${pr.head.sha}' ≠ artifact SHA '${artifactSha}'.`);
+              return;
+            }
+
+            // State: deploy requires explicitly 'open'; cleanup requires explicitly 'closed'.
+            if (prAction === 'deploy') {
+              if (pr.state !== 'open') {
+                core.setFailed(
+                  `PR #${authoritativePrNumber} is '${pr.state}' but artifact requests deploy. Refusing.`
+                );
+                return;
+              }
+            } else {
+              // Cleanup: PR must already be explicitly closed or merged.
+              if (pr.state !== 'closed') {
+                core.setFailed(
+                  `PR #${authoritativePrNumber} is '${pr.state}' (not explicitly 'closed') but artifact requests cleanup. Refusing.`
+                );
+                return;
+              }
+            }
+
+            // Head repository: live value may be null for a deleted fork.
+            const liveHeadRepo = pr.head.repo ? pr.head.repo.full_name : null;
+            if (liveHeadRepo !== null && artifactHeadRepo && liveHeadRepo !== artifactHeadRepo) {
+              core.setFailed(
+                `Head repo mismatch: artifact '${artifactHeadRepo}' vs live '${liveHeadRepo}'.`
+              );
+              return;
+            }
+            if (liveHeadRepo === null && prAction === 'deploy') {
+              // Cannot deploy when the fork source is gone.
+              core.setFailed(
+                `PR #${authoritativePrNumber} head repo is null (fork deleted). Cannot deploy.`
+              );
+              return;
+            }
+            // Cleanup with deleted fork: identity is verified via authoritative PR
+            // number (Step A/B) + base repo + head SHA. No further head-repo check needed.
+
+            core.setOutput('pr_head_sha_short', artifactSha.substring(0, 7));
+            console.log('All identity and state checks passed.');
+
+      # ── 6a. Deploy preview (deploy path) ──────────────────────────────────
+      # JamesIves/github-pages-deploy-action@v4:
+      #   - target-folder scopes the deploy to pr-preview/pr-N/ only.
+      #   - clean: true removes stale files within that subdirectory only;
+      #     it does NOT touch other PR preview directories.
+      #   - force: false enables a git rebase+retry loop on push rejection,
+      #     which safely handles concurrent deployments from different PRs.
+      #   - attempt-limit: 5 — if all 5 retries fail the job exits non-zero.
+      #     This is an acknowledged limitation: very high concurrency could
+      #     exhaust retries.  It is logged clearly rather than silently ignored.
+      - name: Deploy preview
+        if: steps.meta.outputs.pr_action == 'deploy'
+        id: deploy
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: dist
+          target-folder: pr-preview/pr-${{ steps.meta.outputs.pr_number }}
+          clean: true
+          force: false
+          attempt-limit: 5
+          commit-message: >-
+            Deploy PR #${{ steps.meta.outputs.pr_number }} preview
+            @ ${{ steps.verify.outputs.pr_head_sha_short }}
+
+      # ── 6b. Cleanup (closed path) ──────────────────────────────────────────
+      # JamesIves does not support deleting a directory, so we use a plain git
+      # step.  The push is retried up to 5 times with a fetch+rebase on each
+      # rejection.  If the directory does not exist the step is a no-op.
+      # Only the pr-preview/pr-N directory is removed; no other paths are touched.
+      - name: Remove preview directory
+        if: steps.meta.outputs.pr_action == 'closed'
+        env:
+          PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          TARGET_DIR="pr-preview/pr-${PR_NUMBER}"
+
+          # Defense-in-depth: assert TARGET_DIR strictly matches pr-preview/pr-<digits>
+          if [[ ! "$TARGET_DIR" =~ ^pr-preview/pr-[0-9]+$ ]]; then
+            echo "::error::Invalid target directory: '$TARGET_DIR'"
+            exit 1
+          fi
+
+          # Check whether refs/heads/gh-pages exists before cloning.
+          # git ls-remote --exit-code --heads exits:
+          #   0: reference found (branch exists)
+          #   2: no matching refs found (branch does not exist)
+          #   other: fatal error (network, authentication, etc.)
+          LS_REMOTE_STATUS=0
+          git ls-remote --exit-code --heads \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" \
+            refs/heads/gh-pages > /dev/null 2>&1 || LS_REMOTE_STATUS=$?
+
+          if [ "$LS_REMOTE_STATUS" -eq 2 ]; then
+            echo "Branch 'gh-pages' does not exist on remote; nothing to remove."
+            exit 0
+          elif [ "$LS_REMOTE_STATUS" -ne 0 ]; then
+            echo "::error::git ls-remote failed with exit code $LS_REMOTE_STATUS"
+            exit 1
+          fi
+
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          git clone --depth 1 --branch gh-pages \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" \
+            gh-pages-clone
+
+          cd gh-pages-clone
+
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "Directory '$TARGET_DIR' does not exist; nothing to remove."
+            exit 0
+          fi
+
+          git rm -rf "$TARGET_DIR"
+          git commit -m "Remove preview for PR #${PR_NUMBER}"
+
+          # Retry push loop: fetch + rebase on rejection, up to 5 attempts.
+          MAX_ATTEMPTS=5
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "Push attempt ${attempt}/${MAX_ATTEMPTS}..."
+            if git push origin gh-pages; then
+              echo "Push succeeded on attempt ${attempt}."
+              exit 0
+            fi
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "Push rejected; fetching and rebasing before retry..."
+              git fetch origin gh-pages
+              git rebase origin/gh-pages
+            fi
+          done
+
+          echo "::error::All ${MAX_ATTEMPTS} push attempts failed. Manual intervention may be required."
+          exit 1
+
+      # ── 7a. PR comment — deploy ────────────────────────────────────────────
+      # marocchino/sticky-pull-request-comment updates the same comment on each
+      # push (identified by header:), avoiding comment spam.
+      # Only safe, pre-validated values are interpolated into the message body.
+      # The raw commit SHA from metadata is used; the commit message is omitted
+      # intentionally because it is an untrusted multiline string.
+      #
+      # Preview URL construction:
+      #   JamesIves/github-pages-deploy-action@v4 outputs only 'deployment-status',
+      #   not a URL.  The Pages URL is deterministic:
+      #     https://<owner>.github.io/<repo>/pr-preview/pr-<N>/
+      #   We use github.repository_owner and github.event.repository.name
+      #   (both set by GitHub infrastructure, not the PR author) together with
+      #   the validated pr_number from the artifact.
+      - name: Comment preview URL on PR
+        if: steps.meta.outputs.pr_action == 'deploy'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pr-preview
+          number: ${{ steps.meta.outputs.pr_number }}
+          message: |
+            <h3><img src="https://www.jenkins.io/images/logos/jenkins/jenkins.svg" height="20" align="top"> &nbsp;Plugin Modernizer Stats — PR Preview</h3>
+
+            | | |
+            | :--- | :--- |
+            | **Status** | :white_check_mark: Deployed successfully :tada: |
+            | **Preview URL** | https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/pr-preview/pr-${{ steps.meta.outputs.pr_number }}/ :rocket: |
+            | **Commit** | `${{ steps.meta.outputs.pr_head_sha }}` |
+
+            > :hourglass: _This preview is updated automatically on each commit push._
+
+      # ── 7b. PR comment — cleanup ───────────────────────────────────────────
+      - name: Comment preview removed on PR
+        if: steps.meta.outputs.pr_action == 'closed'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pr-preview
+          number: ${{ steps.meta.outputs.pr_number }}
+          message: |
+            <h3><img src="https://www.jenkins.io/images/logos/jenkins/jenkins.svg" height="20" align="top"> &nbsp;Plugin Modernizer Stats — PR Preview</h3>
+
+            | | |
+            | :--- | :--- |
+            | **Status** | :wastebasket: Preview removed |
+
+            > :wastebasket: _The preview for this PR has been removed because the pull request was closed._

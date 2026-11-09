@@ -3,12 +3,17 @@ name: CI
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, closed]
 
 permissions:
   contents: read
 
 jobs:
+  # ── existing build job ─────────────────────────────────────────────────────
   build:
+    # Skip the full build/lint/test pipeline when the PR is simply being closed;
+    # those checks are not meaningful at that point and waste runner minutes.
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,3 +40,152 @@ jobs:
       - run: npm run test
 
       - run: npm run build
+
+  # ── preview-build job ──────────────────────────────────────────────────────
+  # Runs only for non-closed PRs and only after the build job succeeds.
+  # Executes in the unprivileged pull_request context: the GITHUB_TOKEN has
+  # contents:read only and cannot write to any branch.  Fork PRs are therefore
+  # safe to build here without fear of privilege escalation.
+  #
+  # Security notes:
+  #   - checkout@v7 fetches refs/pull/N/merge (the merge commit) automatically
+  #     in pull_request context.  No allow-unsafe-pr-checkout is needed or used.
+  #   - report.json is fetched directly from the canonical public URL with curl,
+  #     bypassing scripts/fetch-metadata.js, which a PR author could modify.
+  #   - All metadata values come from github.event.pull_request.* (the event
+  #     payload), never from git commands.  github.sha would give the merge
+  #     commit; github.event.pull_request.head.sha gives the real PR tip.
+  #   - cache: npm is safe even for external forks: GitHub enforces read-only
+  #     cache access at the platform level for fork pull_request workflows.
+  preview-build:
+    needs: [build]
+    if: github.event.action != 'closed'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v7
+        # In pull_request context, checkout@v7 automatically fetches the merge
+        # commit (refs/pull/N/merge).  No special ref override is needed and no
+        # unsafe flags are set.
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          # For external fork PRs the cache restore succeeds (merge-ref fallback
+          # chain) but the save step prints a warning and continues; not fatal.
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch report.json from canonical source
+        # Fetch directly from the fixed trusted URL instead of running
+        # scripts/fetch-metadata.js, which the PR author controls.
+        run: |
+          mkdir -p public/data
+          curl -sSf \
+            https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json \
+            -o public/data/report.json
+
+      - name: Build preview site
+        # Override the vite base path so all asset links point at the preview
+        # subdirectory rather than the production root.
+        # PR-controlled values (repo name, PR number) are passed through env
+        # variables and double-quoted in the shell, not interpolated directly
+        # into the script text.  PR number is an integer from the event payload;
+        # repo name is set by the repository owner, not the PR author.
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          npx tsc -b
+          npx vite build \
+            --base "/${REPO_NAME}/pr-preview/pr-${PR_NUMBER}/"
+          cp dist/index.html dist/404.html
+
+      - name: Write PR metadata
+        # All values come from the event payload.
+        # github.event.pull_request.head.sha is the real PR tip commit;
+        # github.sha is the temporary merge commit and must NOT be used here.
+        # All values are passed through env variables and written with printf,
+        # so a branch name or repo name containing shell metacharacters cannot
+        # escape the string assignment.
+        env:
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF:  ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_BASE_REF:  ${{ github.event.pull_request.base.ref }}
+        run: |
+          mkdir -p pr-metadata
+          printf '%s' 'deploy'          > pr-metadata/pr-action
+          printf '%s' "${PR_NUMBER}"    > pr-metadata/pr-number
+          printf '%s' "${PR_HEAD_SHA}"  > pr-metadata/pr-head-sha
+          printf '%s' "${PR_HEAD_REF}"  > pr-metadata/pr-head-ref
+          printf '%s' "${PR_HEAD_REPO}" > pr-metadata/pr-head-repo
+          printf '%s' "${PR_BASE_REPO}" > pr-metadata/pr-base-repo
+          printf '%s' "${PR_BASE_REF}"  > pr-metadata/pr-base-ref
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-preview-build
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-metadata
+          path: pr-metadata/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── preview-cleanup job ────────────────────────────────────────────────────
+  # Runs ONLY when a PR is closed (merged or unmerged).
+  # Has no needs: dependency so it runs even if the build or preview-build job
+  # previously failed for this PR.
+  # Does not check out code, run npm, or perform any build steps.
+  # Uploads only the metadata artifact; the deploy workflow reads pr-action and
+  # handles the git-level directory removal.
+  preview-cleanup:
+    if: github.event.action == 'closed'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write cleanup metadata
+        # All values come from the event payload and are passed through env
+        # variables, not interpolated directly into the shell script text.
+        env:
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF:  ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_BASE_REF:  ${{ github.event.pull_request.base.ref }}
+        run: |
+          mkdir -p pr-metadata
+          printf '%s' 'closed'          > pr-metadata/pr-action
+          printf '%s' "${PR_NUMBER}"    > pr-metadata/pr-number
+          printf '%s' "${PR_HEAD_SHA}"  > pr-metadata/pr-head-sha
+          printf '%s' "${PR_HEAD_REF}"  > pr-metadata/pr-head-ref
+          printf '%s' "${PR_HEAD_REPO}" > pr-metadata/pr-head-repo
+          printf '%s' "${PR_BASE_REPO}" > pr-metadata/pr-base-repo
+          printf '%s' "${PR_BASE_REF}"  > pr-metadata/pr-base-ref
+
+      - name: Upload cleanup metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-metadata
+          path: pr-metadata/
+          if-no-files-found: error
+          retention-days: 7
+          # Note: pr-preview-build is intentionally NOT uploaded for cleanup
+          # runs.  The deploy workflow branches on pr-action and skips the
+          # JamesIves deploy step entirely when pr-action == 'closed'.
