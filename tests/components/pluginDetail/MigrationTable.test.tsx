@@ -103,4 +103,15 @@ describe('MigrationTable (card-based)', () => {
     renderTable();
     expect(screen.getByText('io.jenkins.tools.pluginmodernizer.SetupJenkinsfile')).toBeDefined();
   });
+
+  it('shows a distinct icon per outcome and does not mark missing status as failed', () => {
+    renderTable([
+      m('success', 'A', '2025-09-03T07-37-22'),
+      m('fail', 'B', '2025-09-02T07-37-22'),
+      m(undefined, 'C', '2025-05-01T07-37-22'),
+    ]);
+    expect(screen.getAllByTestId('CheckCircleOutlinedIcon')).toHaveLength(1);
+    expect(screen.getAllByTestId('CancelOutlinedIcon')).toHaveLength(1);
+    expect(screen.getAllByTestId('HelpOutlineOutlinedIcon')).toHaveLength(1);
+  });
 });
