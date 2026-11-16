@@ -6,6 +6,7 @@ import { alpha } from '@mui/material/styles';
 import CheckCircleOutlined from '@mui/icons-material/CheckCircleOutlined';
 import CancelOutlined from '@mui/icons-material/CancelOutlined';
 import CalendarTodayOutlined from '@mui/icons-material/CalendarTodayOutlined';
+import HelpOutlineOutlined from '@mui/icons-material/HelpOutlineOutlined';
 import { FaCodeBranch } from 'react-icons/fa';
 import { FiExternalLink } from 'react-icons/fi';
 import type { Migration } from '../../types';
@@ -23,8 +24,6 @@ interface MigrationCardProps {
 }
 
 export default function MigrationCard({ migration: m }: MigrationCardProps) {
-  const isSuccess = m.migrationStatus === 'success';
-
   return (
     <Box
       sx={{
@@ -36,10 +35,13 @@ export default function MigrationCard({ migration: m }: MigrationCardProps) {
     >
       {/* Top row: status icon + name + PR badge + date */}
       <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5, mb: 1 }}>
-        {isSuccess ? (
+        {m.migrationStatus === 'success' ? (
           <CheckCircleOutlined sx={{ fontSize: 24, color: colors.success.light, mt: 0.25, flexShrink: 0 }} />
-        ) : (
+        ) : m.migrationStatus === 'fail' ? (
           <CancelOutlined sx={{ fontSize: 24, color: colors.error.light, mt: 0.25, flexShrink: 0 }} />
+        ) : (
+          // Records from before June 2025 carry no migrationStatus (see docs/statistics.md)
+          <HelpOutlineOutlined sx={{ fontSize: 24, color: colors.text.muted, mt: 0.25, flexShrink: 0 }} />
         )}
         <Box sx={{ flex: 1, minWidth: 0 }}>
           <Typography sx={{ fontWeight: 700, color: colors.text.dark, fontSize: '1rem', lineHeight: 1.3 }}>
