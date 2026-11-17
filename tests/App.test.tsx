@@ -32,7 +32,8 @@ describe('App error boundary', () => {
     render(<App />);
     expect(await screen.findByText('Something went wrong')).toBeDefined();
 
-    fireEvent.click(screen.getByText('Dashboard'));
+    fireEvent.click(screen.getByRole('button', { name: 'Open navigation menu' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
     expect(await screen.findByText('dashboard page')).toBeDefined();
     expect(screen.queryByText('Something went wrong')).toBeNull();
   });
