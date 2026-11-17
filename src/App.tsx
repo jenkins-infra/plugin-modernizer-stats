@@ -26,7 +26,8 @@ function AppRoutes() {
   const location = useLocation();
   return (
     <Layout>
-      <ErrorBoundary>
+      {/* keyed on the path so a render error on one page doesn't stick after navigating away */}
+      <ErrorBoundary key={location.pathname}>
         <Suspense fallback={<Loading />}>
           <Routes>
             <Route path="/" element={<Dashboard />} />
