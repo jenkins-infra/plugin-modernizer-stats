@@ -1,4 +1,4 @@
-import type { Migration, PluginStatusColor } from '../types';
+import type { Migration, PluginReport, PluginStatusColor, StatusCounts } from '../types';
 
 /**
  * Derive a color representing the overall status of a plugin for status badge.
@@ -25,4 +25,15 @@ export function deriveStatus(migrations: Migration[]): PluginStatusColor {
 
   const failPercent = (failCount / (successCount + failCount)) * 100;
   return failPercent < 50 ? 'blue' : 'yellow';
+}
+
+/**
+ * Count plugins grouped by their derived status color.
+ */
+export function countByStatus(plugins: PluginReport[]): StatusCounts {
+  const counts: StatusCounts = { green: 0, red: 0, blue: 0, yellow: 0, white: 0 };
+  for (const p of plugins) {
+    counts[deriveStatus(p.migrations)]++;
+  }
+  return counts;
 }

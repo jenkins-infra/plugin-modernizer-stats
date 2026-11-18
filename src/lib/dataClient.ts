@@ -47,7 +47,7 @@ function getReport(): Promise<Result<ReportJson>> {
   return reportPromise;
 }
 
-function buildPluginReport(pluginId: string, pluginData: PluginData): PluginReport {
+export function buildPluginReport(pluginId: string, pluginData: PluginData): PluginReport {
   const migrations = pluginData.aggregatedMigrations ?? [];
   let successCount = 0;
   let failCount = 0;

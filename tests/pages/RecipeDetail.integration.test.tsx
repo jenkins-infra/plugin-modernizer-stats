@@ -1,24 +1,19 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReportJson } from '../../src/types';
-
-const REPORT_URL = 'https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json';
+import { mockReport } from '../fixtures/report';
 
 /**
- * Integration tests that fetch the real report.json and validate
- * RecipeDetail page data flows correctly through dataClient.
+ * Integration tests that validate RecipeDetail page data flows
+ * correctly through dataClient using a deterministic report.json fixture.
  */
-describe('RecipeDetail integration (real report.json)', () => {
+describe('RecipeDetail integration (report.json fixture)', () => {
   let realReport: ReportJson;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     vi.resetModules();
     vi.restoreAllMocks();
 
-    const res = await fetch(REPORT_URL);
-    if (!res.ok) {
-      throw new Error(`Failed to fetch report.json: HTTP ${res.status} ${res.statusText}`);
-    }
-    realReport = (await res.json()) as ReportJson;
+    realReport = mockReport;
 
     vi.stubGlobal(
       'fetch',
@@ -27,6 +22,10 @@ describe('RecipeDetail integration (real report.json)', () => {
         json: () => Promise.resolve(realReport),
       })
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('getRecipe returns consistent data for all recipes', async () => {

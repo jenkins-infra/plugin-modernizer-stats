@@ -1,21 +1,19 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReportJson } from '../../src/types';
-
-const REPORT_URL = 'https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json';
+import { mockReport } from '../fixtures/report';
 
 /**
- * These tests fetch the real report.json, feed it to dataClient via mocked fetch
+ * These tests feed a deterministic report.json fixture to dataClient via mocked fetch
  * and validate that dataClient produces correct results matching the raw data.
  */
-describe('dataClient validated against actual report.json', () => {
+describe('dataClient validated against report.json fixture', () => {
   let realReport: ReportJson;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     vi.resetModules();
     vi.restoreAllMocks();
 
-    const res = await fetch(REPORT_URL);
-    realReport = (await res.json()) as ReportJson;
+    realReport = mockReport;
 
     vi.stubGlobal(
       'fetch',
@@ -24,6 +22,10 @@ describe('dataClient validated against actual report.json', () => {
         json: () => Promise.resolve(realReport),
       })
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('getAllPlugins total migrations matches report.overview.totalMigrations', async () => {
