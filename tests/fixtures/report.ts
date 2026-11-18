@@ -52,8 +52,9 @@ export const mockReport: ReportJson = {
   ],
   pluginsWithFailedMigrations: ['testfairy', 'CustomHistory', 'absint-a3', 'google-analytics-usage-reporter'],
   timeline: [
-    { month: '2025-07', success: 4, fail: 3, total: 7 },
-    { month: '2025-09', success: 5, fail: 3, total: 8 },
+    { month: '2025-07', success: 2, fail: 2, total: 4 },
+    { month: '2025-08', success: 1, fail: 0, total: 2 },
+    { month: '2025-09', success: 6, fail: 4, total: 10 },
   ],
   tags: [
     { tag: 'chore', count: 10 },
