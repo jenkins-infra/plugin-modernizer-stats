@@ -1,0 +1,729 @@
+# Privileged PR preview deployment workflow.
+#
+# Triggered by workflow_run after the CI workflow completes on pull_request
+# events. This workflow runs in the context of the BASE repository and has
+# write access to contents and pull-requests — it NEVER checks out or
+# executes code from the PR branch.
+#
+# Security model:
+#   1. The CI workflow (pull_request trigger) builds PR code with read-only
+#      permissions and uploads a build artifact.
+#   2. This workflow downloads only that artifact, validates it, and deploys
+#      the pre-built static files to gh-pages.
+#   3. All PR metadata is verified against the GitHub API before deployment.
+#   4. Fork PRs are fully supported without granting write access to forks.
+#
+# Security Notice — Same-Origin Storage Risk:
+#   PR previews are deployed to subdirectories of the shared GitHub Pages origin
+#   (https://<owner>.github.io/<repo>/pr-preview/pr-N/). Because the browser
+#   Same-Origin Policy is scoped to (protocol, host, port) and does NOT isolate
+#   by path, previews share the same localStorage, sessionStorage, IndexedDB,
+#   and cookies with the production site and other previews on this origin.
+#   Previews must only be deployed with this shared-origin trust model understood.
+#
+# Architecture:
+#   - Deploy: copies dist/ to gh-pages branch at pr-preview/pr-N/
+#   - Cleanup: removes pr-preview/pr-N/ from gh-pages branch
+#   - Both operations are serialized via a shared concurrency group.
+#     Note: GitHub Actions concurrency with cancel-in-progress: false retains
+#     only the most recent pending run in the concurrency group, superseding
+#     intermediate pending runs. This tradeoff is required to prevent concurrent
+#     push conflicts to the shared gh-pages branch.
+
+name: Deploy PR Preview
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  checks: read
+
+concurrency:
+  group: pages-branch-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy-preview:
+    # Only run for pull_request-triggered CI runs
+    if: >-
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # ── Step 1: Download artifact from triggering workflow run ──────────────
+      # Uses the REST API because workflow_run does not share the artifact
+      # namespace with the triggering run.
+      - name: Download PR preview artifact
+        id: download
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const runId = context.payload.workflow_run.id;
+            core.info(`Downloading artifacts from workflow run ${runId}`);
+
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+
+            const match = artifacts.data.artifacts.find(a => a.name === 'pr-preview');
+            if (!match) {
+              core.setFailed('No pr-preview artifact found — CI may have skipped the preview build.');
+              return;
+            }
+
+            core.info(`Found artifact ${match.id} (${match.size_in_bytes} bytes)`);
+
+            // Verify maximum compressed size BEFORE downloading (defense against oversized payloads)
+            const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024; // 50 MB
+            if (match.size_in_bytes > MAX_ARTIFACT_BYTES) {
+              core.setFailed(
+                `Artifact size (${match.size_in_bytes} bytes) exceeds maximum allowed ` +
+                `compressed size (${MAX_ARTIFACT_BYTES} bytes). Failing closed.`
+              );
+              return;
+            }
+
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: match.id,
+              archive_format: 'zip',
+            });
+
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/pr-preview.zip', Buffer.from(download.data));
+            core.info('Artifact downloaded to /tmp/pr-preview.zip');
+
+      # ── Step 2: Validate and safely extract artifact ZIP ────────────────────
+      # Defense-in-depth: validate all entries, reject symlinks, traversal,
+      # backslashes, duplicates, conflicts, special types, and safely extract
+      # via Python into a newly created empty directory.
+      - name: Validate and safely extract artifact ZIP
+        run: |
+          python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" << 'PYEOF'
+          import zipfile, sys, os, shutil
+
+          MAX_ENTRY_SIZE = 200 * 1024 * 1024
+          MAX_TOTAL_SIZE = 500 * 1024 * 1024
+          MAX_ENTRIES = 50000
+          DEST_DIR = os.path.join(os.environ['GITHUB_WORKSPACE'], 'pr-preview-dist')
+
+          if os.path.exists(DEST_DIR):
+              shutil.rmtree(DEST_DIR)
+          os.makedirs(DEST_DIR, exist_ok=False)
+
+          with zipfile.ZipFile('/tmp/pr-preview.zip', 'r') as zf:
+              entries = zf.infolist()
+              if len(entries) > MAX_ENTRIES:
+                  print(f"::error::ZIP has {len(entries)} entries (max {MAX_ENTRIES})")
+                  sys.exit(1)
+
+              total_size = sum(entry.file_size for entry in entries)
+              if total_size > MAX_TOTAL_SIZE:
+                  print(f"::error::ZIP aggregate uncompressed size {total_size} bytes exceeds limit {MAX_TOTAL_SIZE}")
+                  sys.exit(1)
+
+              seen_names = set()
+              seen_normalized = set()
+              seen_dirs = set()
+              seen_files = set()
+
+              for entry in entries:
+                  name = entry.filename
+                  if not name:
+                      print("::error::Empty ZIP entry filename rejected")
+                      sys.exit(1)
+
+                  if name in seen_names:
+                      print(f"::error::Duplicate ZIP entry detected: {name}")
+                      sys.exit(1)
+                  seen_names.add(name)
+
+                  if '\\' in name:
+                      print(f"::error::Backslash detected in ZIP entry filename: {name}")
+                      sys.exit(1)
+
+                  normalized = os.path.normpath(name)
+                  if not normalized or normalized == '.':
+                      print(f"::error::Empty or root-only ZIP entry name rejected: {name!r}")
+                      sys.exit(1)
+
+                  if normalized in seen_normalized:
+                      print(f"::error::Duplicate normalized ZIP entry detected: {name} ({normalized})")
+                      sys.exit(1)
+                  seen_normalized.add(normalized)
+
+                  if os.path.isabs(name) or os.path.isabs(normalized) or normalized == '..' or normalized.startswith('..' + os.sep) or normalized.startswith('../'):
+                      print(f"::error::Path traversal detected: {name}")
+                      sys.exit(1)
+
+                  parts = normalized.split(os.sep)
+                  if any(p == '..' for p in parts):
+                      print(f"::error::Path traversal component detected: {name}")
+                      sys.exit(1)
+
+                  unix_mode = entry.external_attr >> 16
+                  if unix_mode != 0:
+                      file_type = unix_mode & 0o170000
+                      if file_type != 0 and file_type not in (0o100000, 0o040000):
+                          print(f"::error::Non-regular file or special Unix type detected (mode {oct(unix_mode)}): {name}")
+                          sys.exit(1)
+
+                  if entry.file_size > MAX_ENTRY_SIZE:
+                      print(f"::error::Entry too large: {name} ({entry.file_size} bytes)")
+                      sys.exit(1)
+
+                  is_dir = entry.is_dir() or name.endswith('/')
+                  if is_dir:
+                      if normalized in seen_files:
+                          print(f"::error::Directory conflicts with existing file path: {normalized}")
+                          sys.exit(1)
+                      dir_prefix = normalized + os.sep
+                      for f in seen_files:
+                          if f.startswith(dir_prefix):
+                              print(f"::error::Directory {normalized} conflicts: existing file {f} would be its child")
+                              sys.exit(1)
+                      parent = os.path.dirname(normalized)
+                      while parent and parent != '.':
+                          if parent in seen_files:
+                              print(f"::error::Parent path is a file, cannot create directory: {normalized}")
+                              sys.exit(1)
+                          parent = os.path.dirname(parent)
+                      seen_dirs.add(normalized)
+                  else:
+                      if normalized in seen_dirs:
+                          print(f"::error::File conflicts with existing directory path: {normalized}")
+                          sys.exit(1)
+                      file_prefix = normalized + os.sep
+                      for d in seen_dirs:
+                          if d.startswith(file_prefix):
+                              print(f"::error::File {normalized} conflicts: existing directory {d} would be its child")
+                              sys.exit(1)
+                      parent = os.path.dirname(normalized)
+                      while parent and parent != '.':
+                          if parent in seen_files:
+                              print(f"::error::Parent path is a file, cannot create file: {normalized}")
+                              sys.exit(1)
+                          parent = os.path.dirname(parent)
+                      seen_files.add(normalized)
+
+              for entry in entries:
+                  name = entry.filename
+                  normalized = os.path.normpath(name)
+                  target_path = os.path.abspath(os.path.join(DEST_DIR, normalized))
+                  if not target_path.startswith(DEST_DIR + os.sep) and target_path != DEST_DIR:
+                      print(f"::error::Target path escapes destination directory: {target_path}")
+                      sys.exit(1)
+
+                  if entry.is_dir() or name.endswith('/'):
+                      os.makedirs(target_path, exist_ok=True)
+                  else:
+                      os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                      with zf.open(entry, 'r') as src, open(target_path, 'wb') as dst:
+                          shutil.copyfileobj(src, dst)
+
+              print(f"ZIP validation and safe extraction passed: {len(entries)} entries, {total_size} bytes aggregate extracted to {DEST_DIR}")
+          PYEOF
+
+      # ── Step 3: Extract artifact and validate metadata ──────────────────────
+      - name: Extract artifact and validate metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          cd "${GITHUB_WORKSPACE}/pr-preview-dist"
+
+          if [ ! -f pr-metadata.txt ]; then
+            echo "::error::pr-metadata.txt not found in artifact"
+            exit 1
+          fi
+
+          echo "=== PR Metadata ==="
+          cat pr-metadata.txt
+          echo "==================="
+
+          python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" << 'PYEOF'
+          import sys, os, re
+
+          REQUIRED_KEYS = {
+              'pr_number', 'pr_action', 'head_sha',
+              'head_ref', 'base_ref', 'repo_full_name', 'sender'
+          }
+
+          def is_valid_git_ref(ref: str) -> bool:
+              if not ref or len(ref) > 255:
+                  return False
+              if not re.fullmatch(r'[a-zA-Z0-9._/-]+', ref):
+                  return False
+              if ref[0] in ('-', '/', '.') or ref.endswith('/') or ref.endswith('.'):
+                  return False
+              if '..' in ref or '//' in ref or '@{' in ref:
+                  return False
+              for part in ref.split('/'):
+                  if not part or part.startswith('.') or part.endswith('.lock'):
+                      return False
+              return True
+
+          meta = {}
+          with open('pr-metadata.txt', 'r', encoding='utf-8') as f:
+              lines = f.read().splitlines()
+
+          if not lines:
+              print("::error::pr-metadata.txt is empty")
+              sys.exit(1)
+
+          for line in lines:
+              if not line or line.isspace():
+                  print(f"::error::Malformed empty line in metadata: {repr(line)}")
+                  sys.exit(1)
+              if '=' not in line:
+                  print(f"::error::Malformed line (missing '='): {line}")
+                  sys.exit(1)
+              key, value = line.split('=', 1)
+              if key in meta:
+                  print(f"::error::Duplicate metadata key: {key}")
+                  sys.exit(1)
+              if key not in REQUIRED_KEYS:
+                  print(f"::error::Unexpected metadata key: {key}")
+                  sys.exit(1)
+              meta[key] = value
+
+          missing = REQUIRED_KEYS - set(meta.keys())
+          if missing:
+              print(f"::error::Missing required metadata fields: {sorted(missing)}")
+              sys.exit(1)
+
+          # Validate field formats
+          if not re.fullmatch(r'[1-9][0-9]*', meta['pr_number']):
+              print(f"::error::Invalid pr_number format: {meta['pr_number']}")
+              sys.exit(1)
+
+          if meta['pr_action'] not in ('deploy', 'closed'):
+              print(f"::error::Invalid pr_action value: {meta['pr_action']} (expected 'deploy' or 'closed')")
+              sys.exit(1)
+
+          if not re.fullmatch(r'[0-9a-f]{40}', meta['head_sha']):
+              print(f"::error::Invalid head_sha format (expected 40-char hex SHA): {meta['head_sha']}")
+              sys.exit(1)
+
+          if not is_valid_git_ref(meta['head_ref']):
+              print(f"::error::Invalid head_ref format: {meta['head_ref']}")
+              sys.exit(1)
+
+          if not is_valid_git_ref(meta['base_ref']):
+              print(f"::error::Invalid base_ref format: {meta['base_ref']}")
+              sys.exit(1)
+
+          if not re.fullmatch(r'[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+', meta['repo_full_name']):
+              print(f"::error::Invalid repo_full_name format: {meta['repo_full_name']}")
+              sys.exit(1)
+
+          if len(meta['sender']) > 45 or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?', meta['sender']):
+              print(f"::error::Invalid sender format: {meta['sender']}")
+              sys.exit(1)
+
+          # Safely write validated fields to GITHUB_OUTPUT
+          output_path = os.environ.get('GITHUB_OUTPUT')
+          if output_path:
+              with open(output_path, 'a', encoding='utf-8') as out:
+                  for k in sorted(REQUIRED_KEYS):
+                      out.write(f"{k}={meta[k]}\n")
+          print(f"Metadata strictly validated: PR #{meta['pr_number']}, action={meta['pr_action']}")
+          PYEOF
+
+      # ── Step 4: Check CI conclusion (deploy only) ───────────────────────────
+      # Only deploy if the CI workflow actually succeeded.
+      - name: Verify CI workflow succeeded
+        if: steps.meta.outputs.pr_action == 'deploy'
+        run: |
+          conclusion="${{ github.event.workflow_run.conclusion }}"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::CI workflow conclusion is '${conclusion}', not 'success'. Skipping deploy."
+            exit 1
+          fi
+          echo "CI conclusion: ${conclusion} ✓"
+
+      # ── Step 5: Verify PR identity via GitHub API ───────────────────────────
+      # Confirms the PR exists, belongs to this repo, matches the triggering
+      # workflow_run event data, and that head SHA matches for both deploy and cleanup.
+      # This prevents a malicious artifact from deploying to or deleting an arbitrary PR.
+      - name: Verify PR identity and freshness via GitHub API
+        id: verify
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          META_PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+          META_PR_ACTION: ${{ steps.meta.outputs.pr_action }}
+          META_HEAD_SHA: ${{ steps.meta.outputs.head_sha }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.META_PR_NUMBER, 10);
+            const prAction = process.env.META_PR_ACTION;
+            const metaHeadSha = process.env.META_HEAD_SHA;
+            const run = context.payload.workflow_run;
+            const runHeadSha = run.head_sha;
+            const runId = run.id;
+
+            core.info(`Verifying PR #${prNumber} (action=${prAction}) for workflow run ${runId}`);
+            core.info(`Metadata head SHA: ${metaHeadSha}`);
+            core.info(`workflow_run head SHA: ${runHeadSha}`);
+
+            // 1. Verify the metadata head SHA matches the triggering workflow_run head SHA
+            if (metaHeadSha !== runHeadSha) {
+              core.setFailed(
+                `Head SHA mismatch: workflow_run says ${runHeadSha}, ` +
+                `artifact says ${metaHeadSha}. Possible stale or tampered run.`
+              );
+              return;
+            }
+
+            // 2. Collect trusted PR numbers independently from all available sources
+            const trustedPrNumbers = new Set();
+
+            // Source A: Webhook payload pull_requests array
+            if (Array.isArray(run.pull_requests)) {
+              for (const p of run.pull_requests) {
+                if (p && typeof p.number === 'number') {
+                  trustedPrNumbers.add(p.number);
+                }
+              }
+            }
+
+            // Source B: Query Workflow Run from GitHub REST API
+            try {
+              const runResp = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId,
+              });
+              if (runResp.data && Array.isArray(runResp.data.pull_requests)) {
+                for (const p of runResp.data.pull_requests) {
+                  if (p && typeof p.number === 'number') {
+                    trustedPrNumbers.add(p.number);
+                  }
+                }
+              }
+            } catch (err) {
+              core.setFailed(`Failed to query workflow run ${runId} via GitHub API: ${err.message}`);
+              return;
+            }
+
+            // Source C: Query Check Suite associated with workflow run if check_suite_id exists
+            if (run.check_suite_id) {
+              try {
+                const suiteResp = await github.rest.checks.getSuite({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  check_suite_id: run.check_suite_id,
+                });
+                if (suiteResp.data && Array.isArray(suiteResp.data.pull_requests)) {
+                  for (const p of suiteResp.data.pull_requests) {
+                    if (p && typeof p.number === 'number') {
+                      trustedPrNumbers.add(p.number);
+                    }
+                  }
+                }
+              } catch (err) {
+                core.setFailed(`Failed to query check suite ${run.check_suite_id} via GitHub API: ${err.message}`);
+                return;
+              }
+            }
+
+            // 3. Require exactly one trusted PR association. If zero or multiple exist, fail closed.
+            if (trustedPrNumbers.size === 0) {
+              const msg = `Could not establish trusted PR identity from workflow_run or check_suite for run ${runId}.`;
+              if (prAction === 'deploy') {
+                core.setFailed(`${msg} Failing closed: deploy aborted.`);
+                return;
+              } else {
+                // For cleanup: safely skip cleanup to guarantee no other PR's preview is deleted
+                core.info(`${msg} Failing closed: skipping cleanup safely to protect other previews.`);
+                return;
+              }
+            }
+
+            if (trustedPrNumbers.size > 1) {
+              const trustedList = Array.from(trustedPrNumbers).map(n => '#' + n).join(', ');
+              const msg = `Ambiguous PR identity: workflow_run ${runId} is associated with multiple PRs (${trustedList}).`;
+              if (prAction === 'deploy') {
+                core.setFailed(`${msg} Failing closed: deploy aborted.`);
+                return;
+              } else {
+                core.info(`${msg} Failing closed: skipping cleanup safely to protect other previews.`);
+                return;
+              }
+            }
+
+            // 4. Verify the single trusted PR number matches the artifact's prNumber
+            const [singleTrustedPr] = Array.from(trustedPrNumbers);
+            if (singleTrustedPr !== prNumber) {
+              core.setFailed(
+                `PR #${prNumber} from artifact metadata does not match the single trusted PR #${singleTrustedPr} ` +
+                `for workflow_run ${runId}. Rejected spoofed or mismatched PR number.`
+              );
+              return;
+            }
+            core.info(`PR #${prNumber} uniquely verified as the single trusted workflow run PR ✓`);
+
+            // 5. Look up the PR via GitHub REST API
+            let pr;
+            try {
+              const resp = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              pr = resp.data;
+            } catch (err) {
+              core.setFailed(`Failed to fetch PR #${prNumber}: ${err.message}`);
+              return;
+            }
+
+            // 6. Verify the PR targets this repository
+            const expectedRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const actualBase = pr.base.repo.full_name;
+            if (actualBase !== expectedRepo) {
+              core.setFailed(
+                `PR #${prNumber} targets ${actualBase}, not ${expectedRepo}`
+              );
+              return;
+            }
+
+            // 7. Verify head SHA matches for BOTH deploy and cleanup
+            if (pr.head.sha !== metaHeadSha || pr.head.sha !== runHeadSha) {
+              core.setFailed(
+                `PR #${prNumber} head SHA (${pr.head.sha}) does not match expected SHA ` +
+                `(metadata=${metaHeadSha}, workflow_run=${runHeadSha}). ` +
+                `Stale run or spoofed PR number.`
+              );
+              return;
+            }
+
+            // 8. Disambiguate multiple PRs sharing a SHA: verify head branch strictly
+            const runHeadBranch = run.head_branch;
+            if (typeof runHeadBranch !== 'string' || runHeadBranch.trim() === '' ||
+                typeof pr.head.ref !== 'string' || pr.head.ref.trim() === '') {
+              core.setFailed(
+                `Missing or invalid head branch: workflow_run head_branch='${runHeadBranch}', ` +
+                `PR head.ref='${pr.head.ref}'. Failing closed.`
+              );
+              return;
+            }
+
+            if (runHeadBranch !== pr.head.ref) {
+              core.setFailed(
+                `PR #${prNumber} head ref (${pr.head.ref}) does not match ` +
+                `workflow_run head branch (${runHeadBranch}).`
+              );
+              return;
+            }
+
+            // 9. Head repository identity verification
+            const runHeadRepo = run.head_repository;
+            if (pr.head.repo !== null) {
+              const prHeadRepoName = pr.head.repo && pr.head.repo.full_name;
+              const runHeadRepoName = runHeadRepo && runHeadRepo.full_name;
+              if (typeof prHeadRepoName !== 'string' || prHeadRepoName.trim() === '' ||
+                  typeof runHeadRepoName !== 'string' || runHeadRepoName.trim() === '') {
+                core.setFailed(
+                  `Missing head repository name: PR head repo='${prHeadRepoName}', ` +
+                  `workflow_run head repo='${runHeadRepoName}'. Failing closed.`
+                );
+                return;
+              }
+              if (prHeadRepoName !== runHeadRepoName) {
+                core.setFailed(
+                  `PR #${prNumber} head repository (${prHeadRepoName}) does not match ` +
+                  `workflow_run head repository (${runHeadRepoName}).`
+                );
+                return;
+              }
+            } else {
+              // Deleted fork repository handling
+              if (prAction === 'deploy') {
+                core.setFailed(
+                  `PR #${prNumber} head repository has been deleted (head.repo is null). ` +
+                  `Cannot deploy preview for a deleted repository. Failing closed.`
+                );
+                return;
+              }
+              // On cleanup: safe to proceed because head SHA, single trusted PR number,
+              // and head branch have all been verified.
+              core.info(
+                `PR #${prNumber} fork repository was deleted (head.repo is null); ` +
+                `head SHA, trusted PR association, and head branch verified. Proceeding with cleanup.`
+              );
+            }
+
+            // 10. For deploy: PR must be open
+            if (prAction === 'deploy' && pr.state !== 'open') {
+              core.setFailed(`PR #${prNumber} is ${pr.state}, not open. Skipping deploy.`);
+              return;
+            }
+
+            // 11. For cleanup: PR must be closed. If reopened, skip cleanup safely.
+            if (prAction === 'closed' && pr.state !== 'closed') {
+              core.info(`PR #${prNumber} is currently ${pr.state} (reopened). Skipping cleanup safely.`);
+              return;
+            }
+
+            core.setOutput('pr_verified', 'true');
+            core.info(`PR #${prNumber} identity, state (${pr.state}), and freshness verified via GitHub API ✓`);
+
+      # ── Step 6a: Deploy preview ─────────────────────────────────────────────
+      - name: Deploy preview to gh-pages
+        if: steps.meta.outputs.pr_action == 'deploy' && steps.verify.outputs.pr_verified == 'true'
+        uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445 # v4
+        with:
+          branch: gh-pages
+          folder: pr-preview-dist/dist
+          target-folder: pr-preview/pr-${{ steps.meta.outputs.pr_number }}
+          force: false
+          commit-message: "deploy: PR #${{ steps.meta.outputs.pr_number }} preview (${{ steps.meta.outputs.head_sha }})"
+
+      # ── Step 6b: Remove preview directory ───────────────────────────────────
+      - name: Remove preview directory
+        if: steps.meta.outputs.pr_action == 'closed' && steps.verify.outputs.pr_verified == 'true'
+        env:
+          PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          PREVIEW_DIR="pr-preview/pr-${PR_NUMBER}"
+
+          # Strict path validation: must match pr-preview/pr-<digits>
+          if ! printf '%s' "$PREVIEW_DIR" | grep -qE '^pr-preview/pr-[0-9]+$'; then
+            echo "::error::Invalid preview directory path: ${PREVIEW_DIR}"
+            exit 1
+          fi
+
+          # Configure authentication via http.extraheader — token never stored in remote URL
+          AUTH_HEADER="Authorization: Basic $(printf '%s' "x-access-token:${GITHUB_TOKEN}" | base64 -w 0)"
+          REPO_URL_NOAUTH="https://github.com/${GITHUB_REPOSITORY}.git"
+
+          # Check whether gh-pages branch exists before attempting clone
+          echo "Checking if gh-pages branch exists..."
+          set +e
+          git -c "http.extraheader=${AUTH_HEADER}" \
+            ls-remote --exit-code --heads "$REPO_URL_NOAUTH" refs/heads/gh-pages
+          LS_EXIT=$?
+          set -e
+
+          case $LS_EXIT in
+            0)
+              echo "gh-pages branch exists, proceeding with cleanup"
+              ;;
+            2)
+              echo "gh-pages branch does not exist — nothing to clean up"
+              exit 0
+              ;;
+            *)
+              echo "::error::git ls-remote failed with exit code ${LS_EXIT}"
+              exit 1
+              ;;
+          esac
+
+          # Clean up any previous clone directory and clone gh-pages branch
+          rm -rf /tmp/gh-pages-cleanup
+          git -c "http.extraheader=${AUTH_HEADER}" \
+            clone --single-branch --branch gh-pages --depth 1 \
+            "$REPO_URL_NOAUTH" /tmp/gh-pages-cleanup
+
+          cd /tmp/gh-pages-cleanup
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Retry push up to 5 times (safely reapplying deletion on rejected push)
+          MAX_ATTEMPTS=5
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "Cleanup push attempt ${attempt}/${MAX_ATTEMPTS}"
+
+            if [ "$attempt" -gt 1 ]; then
+              echo "Push rejected. Fetching latest gh-pages branch and reapplying deletion..."
+              if ! git -c "http.extraheader=${AUTH_HEADER}" \
+                fetch origin +refs/heads/gh-pages:refs/remotes/origin/gh-pages; then
+                echo "Fetch failed on attempt ${attempt}, will retry..."
+                sleep 2
+                continue
+              fi
+              if ! git reset --hard refs/remotes/origin/gh-pages; then
+                echo "Reset failed on attempt ${attempt}, will retry..."
+                sleep 2
+                continue
+              fi
+            fi
+
+            if [ ! -d "$PREVIEW_DIR" ]; then
+              echo "Preview directory ${PREVIEW_DIR} does not exist — nothing to remove"
+              exit 0
+            fi
+
+            rm -rf "$PREVIEW_DIR"
+
+            # Remove parent pr-preview/ dir if empty
+            if [ -d "pr-preview" ] && [ -z "$(ls -A pr-preview 2>/dev/null)" ]; then
+              rmdir pr-preview
+            fi
+
+            git add -A
+
+            if git diff --cached --quiet; then
+              echo "No changes to commit"
+              exit 0
+            fi
+
+            if ! git commit -m "cleanup: remove PR #${PR_NUMBER} preview"; then
+              echo "Commit failed on attempt ${attempt}, will retry..."
+              sleep 2
+              continue
+            fi
+
+            if git -c "http.extraheader=${AUTH_HEADER}" push origin gh-pages; then
+              echo "Push succeeded on attempt ${attempt}"
+              exit 0
+            fi
+
+            echo "Push failed on attempt ${attempt}, will fetch and retry..."
+            sleep 2
+          done
+
+          echo "::error::Failed to push cleanup after ${MAX_ATTEMPTS} attempts"
+          exit 1
+
+      # ── Step 7a: Comment preview URL on PR ──────────────────────────────────
+      - name: Comment preview URL on PR
+        if: steps.meta.outputs.pr_action == 'deploy' && steps.verify.outputs.pr_verified == 'true'
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2
+        with:
+          header: pr-preview
+          number: ${{ steps.meta.outputs.pr_number }}
+          message: |
+            ## 🚀 PR Preview
+
+            | Details | |
+            |---|---|
+            | **Preview URL** | https://${{ github.repository_owner }}.github.io/plugin-modernizer-stats/pr-preview/pr-${{ steps.meta.outputs.pr_number }}/ |
+            | **Commit** | ${{ steps.meta.outputs.head_sha }} |
+            | **Deployed at** | ${{ github.event.workflow_run.updated_at }} |
+
+            > Built from the PR head commit. Note: Previews share the GitHub Pages origin with production (shared browser storage). The preview will be removed when this PR is closed.
+
+      # ── Step 7b: Comment cleanup notice on PR ───────────────────────────────
+      - name: Comment preview removed on PR
+        if: steps.meta.outputs.pr_action == 'closed' && steps.verify.outputs.pr_verified == 'true'
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2
+        with:
+          header: pr-preview
+          number: ${{ steps.meta.outputs.pr_number }}
+          message: |
+            ## 🧹 PR Preview Removed
+
+            The preview for this PR has been cleaned up.

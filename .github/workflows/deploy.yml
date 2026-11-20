@@ -1,3 +1,20 @@
+# Production deployment to GitHub Pages.
+#
+# Uses JamesIves/github-pages-deploy-action to push to the gh-pages branch
+# instead of actions/deploy-pages so that PR previews can coexist in
+# pr-preview/pr-N/ subdirectories without being overwritten.
+#
+# Prerequisite: set the GitHub Pages source to "Deploy from a branch" →
+# gh-pages / root in the repository settings.
+#
+# Concurrency:
+#   Shared concurrency group 'pages-branch-deploy' serializes all pushes to
+#   the gh-pages branch (production deploy, PR preview deploy, and PR cleanup).
+#   Note: GitHub Actions concurrency with cancel-in-progress: false retains only
+#   the most recent pending run in the concurrency group, superseding intermediate
+#   pending runs. This tradeoff is required to prevent concurrent push conflicts
+#   to the shared gh-pages branch.
+
 name: Deploy to GitHub Pages
 
 on:
@@ -6,21 +23,19 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: pages-branch-deploy
+  cancel-in-progress: false
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 26
           cache: npm
@@ -31,16 +46,12 @@ jobs:
 
       - run: npm run build
 
-      - uses: actions/upload-pages-artifact@v5
+      # JamesIves/github-pages-deploy-action@v4 clean-exclude option preserves
+      # the pr-preview directory so that active PR preview builds are not wiped
+      # out during production deployments to the gh-pages branch.
+      - name: Deploy to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445 # v4
         with:
-          path: dist
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+          branch: gh-pages
+          folder: dist
+          clean-exclude: pr-preview
