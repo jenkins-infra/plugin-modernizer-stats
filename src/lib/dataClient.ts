@@ -14,7 +14,87 @@ const REPORT_URL = `${import.meta.env.BASE_URL}data/report.json`;
 
 let reportPromise: Promise<Result<ReportJson>> | null = null;
 
-async function fetchJson<T>(url: string): Promise<Result<T>> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isNumber(value: unknown): value is boolean {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+function isReportJson(value: unknown): value is ReportJson {
+  if (!isRecord(value)) return false;
+
+  const overview = value.overview;
+  const pullRequests = value.pullRequests;
+  const meta = value.meta;
+
+  if (
+    !isString(value.schemaVersion) ||
+    !isString(value.generatedAt) ||
+    !isString(value.dataSource) ||
+    !isRecord(meta) ||
+    !isString(meta.source_sha256) ||
+    !isString(meta.parsed_at) ||
+    !isRecord(overview) ||
+    !isNumber(overview.totalPlugins) ||
+    !isNumber(overview.totalMigrations) ||
+    !isNumber(overview.successfulMigrations) ||
+    !isNumber(overview.failedMigrations) ||
+    !isNumber(overview.successRate) ||
+    !isRecord(pullRequests) ||
+    !isNumber(pullRequests.totalPRs) ||
+    !isNumber(pullRequests.openPRs) ||
+    !isNumber(pullRequests.closedPRs) ||
+    !isNumber(pullRequests.mergedPRs) ||
+    !isNumber(pullRequests.mergeRate) ||
+    !Array.isArray(value.failuresByRecipe) ||
+    !Array.isArray(value.pluginsWithFailedMigrations) ||
+    !Array.isArray(value.timeline) ||
+    !Array.isArray(value.tags) ||
+    !isRecord(value.recipes) ||
+    !isRecord(value.plugins)
+  ) {
+    return false;
+  }
+
+  return (
+    value.failuresByRecipe.every((entry) => isRecord(entry) && isString(entry.recipeId) && isNumber(entry.failures)) &&
+    value.pluginsWithFailedMigrations.every(isString) &&
+    value.timeline.every(
+      (entry) =>
+        isRecord(entry) &&
+        isString(entry.month) &&
+        isNumber(entry.success) &&
+        isNumber(entry.fail) &&
+        isNumber(entry.total)
+    ) &&
+    value.tags.every((entry) => isRecord(entry) && isString(entry.tag) && isNumber(entry.count)) &&
+    Object.values(value.recipes).every(
+      (recipe) =>
+        isRecord(recipe) &&
+        isString(recipe.recipeId) &&
+        isNumber(recipe.totalApplications) &&
+        isNumber(recipe.successCount) &&
+        isNumber(recipe.failureCount) &&
+        Array.isArray(recipe.plugins) &&
+        recipe.plugins.every(
+          (plugin) =>
+            isRecord(plugin) && isString(plugin.pluginName) && isString(plugin.status) && isString(plugin.timestamp)
+        )
+    ) &&
+    Object.values(value.plugins).every(
+      (plugin) =>
+        isRecord(plugin) && Array.isArray(plugin.aggregatedMigrations) && Array.isArray(plugin.failedMigrations)
+    )
+  );
+}
+
+async function fetchReport(url: string): Promise<Result<ReportJson>> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
@@ -22,7 +102,13 @@ async function fetchJson<T>(url: string): Promise<Result<T>> {
     if (!res.ok) {
       return { ok: false, error: `HTTP ${res.status}: ${res.statusText}` };
     }
-    const data: T = await res.json();
+    const data: unknown = await res.json();
+    if (!isReportJson(data)) {
+      return {
+        ok: false,
+        error: 'Metadata report has an unsupported format. It may be updating; please try again shortly.',
+      };
+    }
     return { ok: true, data };
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
@@ -39,7 +125,7 @@ async function fetchJson<T>(url: string): Promise<Result<T>> {
 
 function getReport(): Promise<Result<ReportJson>> {
   if (!reportPromise) {
-    reportPromise = fetchJson<ReportJson>(REPORT_URL).then((result) => {
+    reportPromise = fetchReport(REPORT_URL).then((result) => {
       if (!result.ok) reportPromise = null;
       return result;
     });

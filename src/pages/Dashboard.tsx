@@ -175,7 +175,7 @@ export default function Dashboard() {
     return (
       <ErrorBanner
         title="Unable to fetch data"
-        message="The dashboard data could not be loaded."
+        message={error ?? 'The dashboard data could not be loaded.'}
         onRetry={handleRetry}
       />
     );

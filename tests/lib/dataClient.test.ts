@@ -303,7 +303,7 @@ function makeReport(overrides: Partial<ReportJson> = {}): ReportJson {
   };
 }
 
-function mockFetchSuccess(report: ReportJson) {
+function mockFetchSuccess(report: unknown) {
   vi.stubGlobal(
     'fetch',
     vi.fn().mockResolvedValue({
@@ -375,6 +375,19 @@ describe('dataClient', () => {
         console.log(`  mock data : fetch returns 500 Internal Server Error`);
         console.log(`  dataClient: error="${result.error}"`);
       }
+    });
+
+    it('returns a recoverable error when the metadata schema is invalid', async () => {
+      const invalidReport = { ...makeReport(), overview: undefined };
+      mockFetchSuccess(invalidReport);
+      const client = await loadClient();
+
+      const result = await client.getSummary();
+
+      expect(result).toEqual({
+        ok: false,
+        error: 'Metadata report has an unsupported format. It may be updating; please try again shortly.',
+      });
     });
   });
 

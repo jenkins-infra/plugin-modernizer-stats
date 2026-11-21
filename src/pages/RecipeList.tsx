@@ -57,13 +57,7 @@ export default function RecipeList() {
 
   if (loading) return <SkeletonList />;
   if (error)
-    return (
-      <ErrorBanner
-        title="Unable to fetch data"
-        message="The recipe list could not be loaded."
-        onRetry={() => window.location.reload()}
-      />
-    );
+    return <ErrorBanner title="Unable to fetch data" message={error} onRetry={() => window.location.reload()} />;
 
   return (
     <Box
