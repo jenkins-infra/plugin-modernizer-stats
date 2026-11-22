@@ -6,7 +6,11 @@ import { colors } from '../theme';
 
 export default function NotFound() {
   useEffect(() => {
+    const previousTitle = document.title;
     document.title = 'Page Not Found | Jenkins Plugin Modernizer Stats';
+    return () => {
+      document.title = previousTitle;
+    };
   }, []);
 
   return (
