@@ -38,10 +38,77 @@ describe('StatCard', () => {
     console.log('  StatCard : clickable and fires onClick');
   });
 
-  it('renders as non-interactive div when onClick is not provided', () => {
-    render(<StatCard value="10" label="Count" icon={<span>icon</span>} color="#3b82f6" />);
+  it('renders as non-interactive div without aria-pressed when onClick is not provided', () => {
+    const { container } = render(<StatCard value="10" label="Count" icon={<span>icon</span>} color="#3b82f6" />);
 
     expect(screen.queryByRole('button')).toBeNull();
+    expect(container.firstElementChild?.getAttribute('aria-pressed')).toBeNull();
     console.log('  StatCard : non-clickable without onClick');
+  });
+
+  it('does not set aria-pressed on a clickable button when active is undefined', () => {
+    const handleClick = vi.fn();
+    render(<StatCard value="5" label="Action" icon={<span>icon</span>} color="#3b82f6" onClick={handleClick} />);
+
+    const button = screen.getByRole('button');
+    expect(button.getAttribute('type')).toBe('button');
+    expect(button.getAttribute('aria-pressed')).toBeNull();
+  });
+
+  it('exposes aria-pressed="false" when inactive and aria-pressed="true" when active', () => {
+    const handleClick = vi.fn();
+    const { rerender } = render(
+      <StatCard
+        value="5"
+        label="All Passed"
+        icon={<span>icon</span>}
+        color="#10b981"
+        onClick={handleClick}
+        active={false}
+      />
+    );
+
+    const button = screen.getByRole('button');
+    expect(button.getAttribute('aria-pressed')).toBe('false');
+
+    rerender(
+      <StatCard
+        value="5"
+        label="All Passed"
+        icon={<span>icon</span>}
+        color="#10b981"
+        onClick={handleClick}
+        active={true}
+      />
+    );
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('supports keyboard focus and toggle state updates on click', () => {
+    function StatefulToggleCard() {
+      const [active, setActive] = React.useState(false);
+      return (
+        <StatCard
+          value="5"
+          label="All Passed"
+          icon={<span>icon</span>}
+          color="#10b981"
+          active={active}
+          onClick={() => setActive((prev) => !prev)}
+        />
+      );
+    }
+
+    render(<StatefulToggleCard />);
+    const button = screen.getByRole('button');
+    button.focus();
+    expect(document.activeElement).toBe(button);
+    expect(button.getAttribute('aria-pressed')).toBe('false');
+
+    fireEvent.click(button);
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+
+    fireEvent.click(button);
+    expect(button.getAttribute('aria-pressed')).toBe('false');
   });
 });
