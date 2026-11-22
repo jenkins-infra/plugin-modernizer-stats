@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { NavLink, matchPath, useLocation } from 'react-router-dom';
 import Box from '@mui/material/Box';
 import Drawer from '@mui/material/Drawer';
 import List from '@mui/material/List';
@@ -26,10 +26,8 @@ export default function Layout({ children }: { children: ReactNode }) {
   const theme = useTheme();
   const isDesktop = useMediaQuery(theme.breakpoints.up('md'));
   const location = useLocation();
-  const navigate = useNavigate();
 
-  const handleNav = (path: string) => {
-    navigate(path);
+  const handleNavClick = () => {
     if (!isDesktop) setMobileOpen(false);
   };
 
@@ -71,14 +69,22 @@ export default function Layout({ children }: { children: ReactNode }) {
         </Box>
       </Box>
 
-      <List sx={{ flex: 1, pt: 1, borderTop: 1, borderColor: 'divider' }}>
+      <List
+        component="nav"
+        aria-label="Primary navigation"
+        sx={{ flex: 1, pt: 1, borderTop: 1, borderColor: 'divider' }}
+      >
         {navItems.map((item) => {
-          const active = location.pathname === item.path;
+          const isIndex = item.path === '/';
+          const active = matchPath({ path: item.path, end: isIndex }, location.pathname) !== null;
           return (
             <ListItemButton
               key={item.path}
+              component={NavLink}
+              to={item.path}
+              end={isIndex}
               selected={active}
-              onClick={() => handleNav(item.path)}
+              onClick={handleNavClick}
               sx={{
                 mx: 1,
                 borderRadius: 1,
@@ -108,7 +114,6 @@ export default function Layout({ children }: { children: ReactNode }) {
       <Box sx={{ display: 'flex', flexDirection: { xs: 'column', md: 'row' }, flex: 1, overflow: 'hidden' }}>
         {isDesktop ? (
           <Box
-            component="nav"
             sx={{
               width: 240,
               flexShrink: 0,
