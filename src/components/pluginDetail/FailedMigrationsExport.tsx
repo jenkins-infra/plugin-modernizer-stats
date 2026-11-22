@@ -14,7 +14,7 @@ interface FailedMigrationsExportProps {
 }
 
 export default function FailedMigrationsExport({ pluginName, failCount }: FailedMigrationsExportProps) {
-  const { data: csvData, loading } = useFailedMigrations(pluginName);
+  const { data: csvData, error, loading } = useFailedMigrations(pluginName);
 
   const handleDownload = useCallback(() => {
     if (!csvData) return;
@@ -50,12 +50,17 @@ export default function FailedMigrationsExport({ pluginName, failCount }: Failed
         <Typography sx={{ fontSize: '0.85rem', color: colors.text.muted, mt: 0.25 }}>
           {failCount} failed migration{failCount !== 1 ? 's' : ''} available for download
         </Typography>
+        {error && (
+          <Typography role="alert" sx={{ fontSize: '0.85rem', color: colors.error.light, mt: 0.5 }}>
+            Unable to prepare CSV export: {error}
+          </Typography>
+        )}
       </Box>
       <Button
         variant="outlined"
         size="small"
         startIcon={loading ? <CircularProgress size={16} /> : <FileDownloadOutlined />}
-        disabled={loading || !csvData}
+        disabled={loading || !!error || !csvData}
         onClick={handleDownload}
         sx={{
           color: colors.error.light,
