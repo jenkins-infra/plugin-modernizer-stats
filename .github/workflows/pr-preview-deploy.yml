@@ -584,7 +584,7 @@ jobs:
           folder: pr-preview-dist/dist
           target-folder: pr-preview/pr-${{ steps.meta.outputs.pr_number }}
           force: false
-          commit-message: "deploy: PR #${{ steps.meta.outputs.pr_number }} preview (${{ steps.meta.outputs.head_sha }})"
+          commit-message: 'deploy: PR #${{ steps.meta.outputs.pr_number }} preview (${{ steps.meta.outputs.head_sha }})'
 
       # ── Step 6b: Remove preview directory ───────────────────────────────────
       - name: Remove preview directory
