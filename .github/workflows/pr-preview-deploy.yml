@@ -353,6 +353,14 @@ jobs:
       # Confirms the PR exists, belongs to this repo, matches the triggering
       # workflow_run event data, and that head SHA matches for both deploy and cleanup.
       # This prevents a malicious artifact from deploying to or deleting an arbitrary PR.
+      #
+      # Identity sources:
+      #   Sources A–C: Webhook payload, getWorkflowRun, and getSuite pull_requests.
+      #   Source D: listPullRequestsAssociatedWithCommit (for merged PRs on default branch).
+      #   Source E: API-backed candidate verification via pulls.get() (for closed PR cleanup,
+      #             including closed-but-unmerged PRs; fails closed if fork is deleted).
+      # All sources require strict cryptographic and API matching; zero or ambiguous
+      # matches fail closed.
       - name: Verify PR identity and freshness via GitHub API
         id: verify
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
@@ -360,14 +368,32 @@ jobs:
           META_PR_NUMBER: ${{ steps.meta.outputs.pr_number }}
           META_PR_ACTION: ${{ steps.meta.outputs.pr_action }}
           META_HEAD_SHA: ${{ steps.meta.outputs.head_sha }}
+          META_BASE_REF: ${{ steps.meta.outputs.base_ref }}
         with:
           script: |
-            const prNumber = parseInt(process.env.META_PR_NUMBER, 10);
+            const rawPrNumber = process.env.META_PR_NUMBER;
+            if (!rawPrNumber || !/^[1-9]\d*$/.test(rawPrNumber)) {
+              core.setFailed(
+                `Invalid PR number format in metadata: '${rawPrNumber}'. Must be a positive integer.`
+              );
+              return;
+            }
+            const prNumber = Number(rawPrNumber);
+            if (!Number.isSafeInteger(prNumber)) {
+              core.setFailed(
+                `PR number is not a safe integer: '${rawPrNumber}'.`
+              );
+              return;
+            }
             const prAction = process.env.META_PR_ACTION;
             const metaHeadSha = process.env.META_HEAD_SHA;
+            const metaBaseRef = process.env.META_BASE_REF;
             const run = context.payload.workflow_run;
             const runHeadSha = run.head_sha;
             const runId = run.id;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const expectedBaseRepo = `${owner}/${repo}`;
 
             core.info(`Verifying PR #${prNumber} (action=${prAction}) for workflow run ${runId}`);
             core.info(`Metadata head SHA: ${metaHeadSha}`);
@@ -382,31 +408,40 @@ jobs:
               return;
             }
 
-            // 2. Collect trusted PR numbers independently from all available sources
+            // 2. Collect trusted PR numbers independently from all available sources.
+            //    Each source is queried separately; a PR number is only trusted if at
+            //    least one source confirms it.
             const trustedPrNumbers = new Set();
+            const trustedSources = new Map(); // prNumber -> source label (for logging)
 
             // Source A: Webhook payload pull_requests array
             if (Array.isArray(run.pull_requests)) {
               for (const p of run.pull_requests) {
                 if (p && typeof p.number === 'number') {
                   trustedPrNumbers.add(p.number);
+                  trustedSources.set(p.number, 'webhook payload pull_requests');
                 }
               }
             }
+            core.info(`Source A (webhook payload pull_requests): found ${
+              [...(Array.isArray(run.pull_requests) ? run.pull_requests : [])].filter(p => p && typeof p.number === 'number').length
+            } PR(s)`);
 
             // Source B: Query Workflow Run from GitHub REST API
             try {
               const runResp = await github.rest.actions.getWorkflowRun({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                run_id: runId,
+                owner, repo, run_id: runId,
               });
               if (runResp.data && Array.isArray(runResp.data.pull_requests)) {
+                let count = 0;
                 for (const p of runResp.data.pull_requests) {
                   if (p && typeof p.number === 'number') {
+                    if (!trustedSources.has(p.number)) trustedSources.set(p.number, 'getWorkflowRun pull_requests');
                     trustedPrNumbers.add(p.number);
+                    count++;
                   }
                 }
+                core.info(`Source B (getWorkflowRun pull_requests): found ${count} PR(s)`);
               }
             } catch (err) {
               core.setFailed(`Failed to query workflow run ${runId} via GitHub API: ${err.message}`);
@@ -417,16 +452,19 @@ jobs:
             if (run.check_suite_id) {
               try {
                 const suiteResp = await github.rest.checks.getSuite({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner, repo,
                   check_suite_id: run.check_suite_id,
                 });
                 if (suiteResp.data && Array.isArray(suiteResp.data.pull_requests)) {
+                  let count = 0;
                   for (const p of suiteResp.data.pull_requests) {
                     if (p && typeof p.number === 'number') {
+                      if (!trustedSources.has(p.number)) trustedSources.set(p.number, 'getSuite pull_requests');
                       trustedPrNumbers.add(p.number);
+                      count++;
                     }
                   }
+                  core.info(`Source C (getSuite pull_requests): found ${count} PR(s)`);
                 }
               } catch (err) {
                 core.setFailed(`Failed to query check suite ${run.check_suite_id} via GitHub API: ${err.message}`);
@@ -434,9 +472,180 @@ jobs:
               }
             }
 
+            // Source D: listPullRequestsAssociatedWithCommit — handles closed/merged PRs.
+            // GitHub clears pull_requests[] from workflow_run and check_suite once a PR is
+            // closed or merged, so Sources A–C return empty for cleanup runs. This endpoint
+            // queries by commit SHA and covers all PR states. Each candidate is strictly
+            // validated before being accepted: PR number, head SHA, base repo, head branch,
+            // and head repo must all match GitHub API data for the runHeadSha.
+            try {
+              const commitPrsResp = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner, repo,
+                commit_sha: runHeadSha,
+              });
+              const candidates = Array.isArray(commitPrsResp.data) ? commitPrsResp.data : [];
+              core.info(`Source D (listPullRequestsAssociatedWithCommit for ${runHeadSha}): found ${candidates.length} PR candidate(s)`);
+
+              for (const candidate of candidates) {
+                if (!candidate || typeof candidate.number !== 'number') continue;
+
+                // Strict validation of each candidate against GitHub API data only
+                // (never against artifact metadata alone):
+
+                // D-i: PR number must match what the artifact claims
+                if (candidate.number !== prNumber) {
+                  core.info(`Source D: skipping PR #${candidate.number} — does not match artifact PR #${prNumber}`);
+                  continue;
+                }
+
+                // D-ii: head SHA of the PR record must equal the workflow_run head SHA
+                if (!candidate.head || candidate.head.sha !== runHeadSha) {
+                  core.info(`Source D: PR #${candidate.number} head SHA mismatch (got ${candidate.head && candidate.head.sha}), skipping`);
+                  continue;
+                }
+
+                // D-iii: base repository and base branch must match
+                if (!candidate.base || !candidate.base.repo ||
+                    candidate.base.repo.full_name !== expectedBaseRepo) {
+                  core.info(`Source D: PR #${candidate.number} base repo mismatch (got ${candidate.base && candidate.base.repo && candidate.base.repo.full_name}), skipping`);
+                  continue;
+                }
+                if (typeof metaBaseRef === 'string' && metaBaseRef.trim() !== '') {
+                  if (!candidate.base.ref || candidate.base.ref !== metaBaseRef) {
+                    core.info(`Source D: PR #${candidate.number} base branch mismatch (PR='${candidate.base.ref}', expected='${metaBaseRef}'), skipping`);
+                    continue;
+                  }
+                }
+
+                // D-iv: head branch must match workflow_run head_branch
+                const runHeadBranch = run.head_branch;
+                if (typeof runHeadBranch !== 'string' || runHeadBranch.trim() === '') {
+                  core.info(`Source D: workflow_run head_branch is missing or empty — cannot validate head branch for PR #${candidate.number}, skipping`);
+                  continue;
+                }
+                if (!candidate.head.ref || candidate.head.ref !== runHeadBranch) {
+                  core.info(`Source D: PR #${candidate.number} head branch mismatch (PR ref='${candidate.head.ref}', run head_branch='${runHeadBranch}'), skipping`);
+                  continue;
+                }
+
+                // D-v: head repository must match workflow_run head_repository (if available)
+                const runHeadRepo = run.head_repository;
+                const runHeadRepoName = runHeadRepo && runHeadRepo.full_name;
+                if (typeof runHeadRepoName === 'string' && runHeadRepoName.trim() !== '') {
+                  const candidateHeadRepoName = candidate.head.repo && candidate.head.repo.full_name;
+                  if (candidateHeadRepoName !== runHeadRepoName) {
+                    core.info(`Source D: PR #${candidate.number} head repo mismatch (PR='${candidateHeadRepoName}', run='${runHeadRepoName}'), skipping`);
+                    continue;
+                  }
+                }
+
+                // All Source D checks passed — accept this PR number as trusted
+                core.info(`Source D: PR #${candidate.number} passed all validation checks ✓`);
+                if (!trustedSources.has(candidate.number)) {
+                  trustedSources.set(candidate.number, 'listPullRequestsAssociatedWithCommit');
+                }
+                trustedPrNumbers.add(candidate.number);
+              }
+            } catch (err) {
+              // Source D failure is non-fatal if Sources A–C already established identity;
+              // but if identity is still unresolved after A–C, it will fail closed below.
+              core.warning(`Source D (listPullRequestsAssociatedWithCommit) failed: ${err.message}. Continuing with other sources.`);
+            }
+
+            // Source E: API-backed candidate verification via pulls.get for closed PR cleanup
+            // GitHub's listPullRequestsAssociatedWithCommit (Source D) only indexes merged
+            // PRs on the default branch and open/merged PRs on non-default branches; it does
+            // NOT guarantee returning closed-but-unmerged PRs or unmerged fork PRs.
+            // When prAction === 'closed', we query pulls.get() using the artifact's claimed prNumber
+            // as an unverified candidate. It is NEVER trusted by itself. It is only accepted into
+            // trustedPrNumbers if the returned GitHub API record strictly satisfies:
+            //   1. Exact PR number: candidate.number === prNumber
+            //   2. Head SHA: candidate.head.sha === runHeadSha (cryptographic agreement)
+            //   3. Base repository & branch: matches expectedBaseRepo and metaBaseRef
+            //   4. Head branch: matches workflow_run head_branch
+            //   5. Head repository: matches workflow_run head_repository (fails closed if null/missing)
+            //   6. State: candidate.state === 'closed' (prevents premature cleanup of open PRs)
+            if (prAction === 'closed') {
+
+              try {
+                core.info(`Source E: evaluating candidate PR #${prNumber} for closed PR cleanup via pulls.get()...`);
+                const candidateResp = await github.rest.pulls.get({
+                  owner, repo,
+                  pull_number: prNumber,
+                });
+                const candidate = candidateResp.data;
+
+                if (candidate && typeof candidate.number === 'number') {
+                  let valid = true;
+
+                  if (candidate.number !== prNumber) {
+                    core.info(`Source E: candidate PR #${candidate.number} does not match claimed PR #${prNumber}`);
+                    valid = false;
+                  }
+
+                  if (candidate.state !== 'closed') {
+                    core.info(`Source E: PR #${candidate.number} is ${candidate.state}, expected 'closed' for cleanup`);
+                    valid = false;
+                  }
+
+                  if (!candidate.head || candidate.head.sha !== runHeadSha) {
+                    core.info(`Source E: PR #${candidate.number} head SHA mismatch (got ${candidate.head && candidate.head.sha}, expected ${runHeadSha})`);
+                    valid = false;
+                  }
+
+                  if (!candidate.base || !candidate.base.repo || candidate.base.repo.full_name !== expectedBaseRepo) {
+                    core.info(`Source E: PR #${candidate.number} base repo mismatch (got ${candidate.base && candidate.base.repo && candidate.base.repo.full_name}, expected ${expectedBaseRepo})`);
+                    valid = false;
+                  }
+
+                  if (typeof metaBaseRef === 'string' && metaBaseRef.trim() !== '') {
+                    if (!candidate.base.ref || candidate.base.ref !== metaBaseRef) {
+                      core.info(`Source E: PR #${candidate.number} base branch mismatch (got ${candidate.base.ref}, expected ${metaBaseRef})`);
+                      valid = false;
+                    }
+                  }
+
+                  const runHeadBranch = run.head_branch;
+                  if (typeof runHeadBranch !== 'string' || runHeadBranch.trim() === '') {
+                    core.info(`Source E: workflow_run head_branch is missing or empty — cannot validate head branch for PR #${candidate.number}`);
+                    valid = false;
+                  } else if (!candidate.head.ref || candidate.head.ref !== runHeadBranch) {
+                    core.info(`Source E: PR #${candidate.number} head branch mismatch (PR ref='${candidate.head.ref}', run head_branch='${runHeadBranch}')`);
+                    valid = false;
+                  }
+
+                  const runHeadRepo = run.head_repository;
+                  const runHeadRepoName = runHeadRepo && typeof runHeadRepo.full_name === 'string' && runHeadRepo.full_name.trim();
+                  if (!runHeadRepoName) {
+                    core.info(`Source E: workflow_run head_repository is null or missing; failing closed for PR #${candidate.number}`);
+                    valid = false;
+                  } else {
+                    const candidateHeadRepoName = candidate.head && candidate.head.repo && typeof candidate.head.repo.full_name === 'string' && candidate.head.repo.full_name.trim();
+                    if (!candidateHeadRepoName) {
+                      core.info(`Source E: candidate PR #${candidate.number} head repository is null or missing (fork may have been deleted); failing closed`);
+                      valid = false;
+                    } else if (candidateHeadRepoName !== runHeadRepoName) {
+                      core.info(`Source E: PR #${candidate.number} head repo mismatch (PR='${candidateHeadRepoName}', run='${runHeadRepoName}')`);
+                      valid = false;
+                    }
+                  }
+
+                  if (valid) {
+                    core.info(`Source E: candidate PR #${candidate.number} strictly verified against GitHub API record and workflow_run ✓`);
+                    if (!trustedSources.has(candidate.number)) {
+                      trustedSources.set(candidate.number, 'pulls.get (closed PR candidate API verification)');
+                    }
+                    trustedPrNumbers.add(candidate.number);
+                  }
+                }
+              } catch (err) {
+                core.info(`Source E: candidate lookup for PR #${prNumber} failed: ${err.message}`);
+              }
+            }
+
             // 3. Require exactly one trusted PR association. If zero or multiple exist, fail closed.
             if (trustedPrNumbers.size === 0) {
-              const msg = `Could not establish trusted PR identity from workflow_run or check_suite for run ${runId}.`;
+              const msg = `Could not establish trusted PR identity from any source (A–E) for run ${runId}.`;
               if (prAction === 'deploy') {
                 core.setFailed(`${msg} Failing closed: deploy aborted.`);
                 return;
@@ -448,8 +657,8 @@ jobs:
             }
 
             if (trustedPrNumbers.size > 1) {
-              const trustedList = Array.from(trustedPrNumbers).map(n => '#' + n).join(', ');
-              const msg = `Ambiguous PR identity: workflow_run ${runId} is associated with multiple PRs (${trustedList}).`;
+              const trustedList = Array.from(trustedPrNumbers).map(n => `#${n} (via ${trustedSources.get(n)})`).join(', ');
+              const msg = `Ambiguous PR identity: run ${runId} yielded multiple trusted PRs: ${trustedList}.`;
               if (prAction === 'deploy') {
                 core.setFailed(`${msg} Failing closed: deploy aborted.`);
                 return;
@@ -468,7 +677,7 @@ jobs:
               );
               return;
             }
-            core.info(`PR #${prNumber} uniquely verified as the single trusted workflow run PR ✓`);
+            core.info(`PR #${prNumber} uniquely verified via: ${trustedSources.get(prNumber)} ✓`);
 
             // 5. Look up the PR via GitHub REST API
             let pr;
@@ -484,12 +693,18 @@ jobs:
               return;
             }
 
-            // 6. Verify the PR targets this repository
+            // 6. Verify the PR targets this repository and expected base branch
             const expectedRepo = `${context.repo.owner}/${context.repo.repo}`;
             const actualBase = pr.base.repo.full_name;
             if (actualBase !== expectedRepo) {
               core.setFailed(
                 `PR #${prNumber} targets ${actualBase}, not ${expectedRepo}`
+              );
+              return;
+            }
+            if (typeof metaBaseRef === 'string' && metaBaseRef.trim() !== '' && pr.base.ref !== metaBaseRef) {
+              core.setFailed(
+                `PR #${prNumber} base branch (${pr.base.ref}) does not match expected base ref (${metaBaseRef}).`
               );
               return;
             }
@@ -523,41 +738,31 @@ jobs:
               return;
             }
 
-            // 9. Head repository identity verification
+            // 9. Head repository identity verification (Strict Fail-Closed)
             const runHeadRepo = run.head_repository;
-            if (pr.head.repo !== null) {
-              const prHeadRepoName = pr.head.repo && pr.head.repo.full_name;
-              const runHeadRepoName = runHeadRepo && runHeadRepo.full_name;
-              if (typeof prHeadRepoName !== 'string' || prHeadRepoName.trim() === '' ||
-                  typeof runHeadRepoName !== 'string' || runHeadRepoName.trim() === '') {
-                core.setFailed(
-                  `Missing head repository name: PR head repo='${prHeadRepoName}', ` +
-                  `workflow_run head repo='${runHeadRepoName}'. Failing closed.`
-                );
-                return;
-              }
-              if (prHeadRepoName !== runHeadRepoName) {
-                core.setFailed(
-                  `PR #${prNumber} head repository (${prHeadRepoName}) does not match ` +
-                  `workflow_run head repository (${runHeadRepoName}).`
-                );
-                return;
-              }
-            } else {
-              // Deleted fork repository handling
-              if (prAction === 'deploy') {
-                core.setFailed(
-                  `PR #${prNumber} head repository has been deleted (head.repo is null). ` +
-                  `Cannot deploy preview for a deleted repository. Failing closed.`
-                );
-                return;
-              }
-              // On cleanup: safe to proceed because head SHA, single trusted PR number,
-              // and head branch have all been verified.
-              core.info(
-                `PR #${prNumber} fork repository was deleted (head.repo is null); ` +
-                `head SHA, trusted PR association, and head branch verified. Proceeding with cleanup.`
+            const runHeadRepoName = runHeadRepo && typeof runHeadRepo.full_name === 'string' && runHeadRepo.full_name.trim();
+            if (!runHeadRepoName) {
+              core.setFailed(
+                `Missing or invalid workflow_run head_repository for run ${runId}. Failing closed.`
               );
+              return;
+            }
+
+            const prHeadRepoName = pr.head && pr.head.repo && typeof pr.head.repo.full_name === 'string' && pr.head.repo.full_name.trim();
+            if (!prHeadRepoName) {
+              core.setFailed(
+                `PR #${prNumber} head repository is null or missing (fork may have been deleted). ` +
+                `Strict head repository verification is mandatory for both deployment and cleanup. Failing closed.`
+              );
+              return;
+            }
+
+            if (prHeadRepoName !== runHeadRepoName) {
+              core.setFailed(
+                `PR #${prNumber} head repository (${prHeadRepoName}) does not match ` +
+                `workflow_run head repository (${runHeadRepoName}). Failing closed.`
+              );
+              return;
             }
 
             // 10. For deploy: PR must be open
