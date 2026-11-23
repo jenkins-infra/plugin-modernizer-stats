@@ -71,8 +71,9 @@ jobs:
 
       - name: Build with PR-specific base path
         run: |
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
           npx tsc -b
-          npx vite build --base "/plugin-modernizer-stats/pr-preview/pr-${PR_NUMBER}/"
+          npx vite build --base "/${REPO_NAME}/pr-preview/pr-${PR_NUMBER}/"
           cp dist/index.html dist/404.html
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
