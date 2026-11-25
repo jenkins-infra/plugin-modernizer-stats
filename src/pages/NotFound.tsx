@@ -4,12 +4,16 @@ import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import { colors } from '../theme';
 
+const NOT_FOUND_TITLE = 'Page Not Found | Jenkins Plugin Modernizer Stats';
+
 export default function NotFound() {
   useEffect(() => {
     const previousTitle = document.title;
-    document.title = 'Page Not Found | Jenkins Plugin Modernizer Stats';
+    document.title = NOT_FOUND_TITLE;
     return () => {
-      document.title = previousTitle;
+      if (document.title === NOT_FOUND_TITLE) {
+        document.title = previousTitle;
+      }
     };
   }, []);
 

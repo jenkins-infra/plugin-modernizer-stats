@@ -77,4 +77,38 @@ describe('NotFound', () => {
     fireEvent.click(screen.getByRole('link', { name: 'Back to homepage' }));
     expect(document.title).toBe(DEFAULT_TITLE);
   });
+
+  it('restores a custom initial document.title on unmount', () => {
+    const customTitle = 'Plugins | Plugin Modernizer Stats';
+    document.title = customTitle;
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <NotFound />
+      </MemoryRouter>
+    );
+
+    expect(document.title).toBe(NOT_FOUND_TITLE);
+
+    unmount();
+
+    expect(document.title).toBe(customTitle);
+  });
+
+  it('does not overwrite document.title when another page updates it before unmount', () => {
+    const nextPageTitle = 'Plugins | Plugin Modernizer Stats';
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <NotFound />
+      </MemoryRouter>
+    );
+
+    expect(document.title).toBe(NOT_FOUND_TITLE);
+
+    document.title = nextPageTitle;
+    unmount();
+
+    expect(document.title).toBe(nextPageTitle);
+  });
 });
