@@ -3,17 +3,15 @@ name: CI
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, closed]
 
 permissions:
   contents: read
 
 jobs:
   build:
-    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7
 
       - name: Setup Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -23,7 +21,7 @@ jobs:
       - name: Run pre-commit
         uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 26
           cache: npm
@@ -34,103 +32,6 @@ jobs:
 
       - run: npm run format:check
 
-      - name: Fetch report.json from canonical source
-        run: |
-          mkdir -p public/data
-          curl -sSf \
-            https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json \
-            -o public/data/report.json
-
       - run: npm run test
 
       - run: npm run build
-
-  # ── PR preview build ─────────────────────────────────────────────────
-  # Builds the Vite app with a PR-specific base path and uploads the
-  # output as an artifact for the privileged deployment workflow.
-  preview-build:
-    needs: [build]
-    if: github.event.action != 'closed'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24
-          cache: npm
-
-      - run: npm ci
-
-      - name: Fetch report.json from canonical source
-        run: |
-          mkdir -p public/data
-          curl -sSf \
-            https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json \
-            -o public/data/report.json
-
-      - name: Build with PR-specific base path
-        run: |
-          REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          npx tsc -b
-          npx vite build --base "/${REPO_NAME}/pr-preview/pr-${PR_NUMBER}/"
-          cp dist/index.html dist/404.html
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-
-      - name: Write PR metadata
-        run: |
-          printf 'pr_number=%s\n' "$PR_NUMBER" > "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'pr_action=%s\n' "deploy" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'head_sha=%s\n' "$HEAD_SHA" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'head_ref=%s\n' "$HEAD_REF" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'base_ref=%s\n' "$BASE_REF" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'repo_full_name=%s\n' "$REPO_FULL_NAME" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'sender=%s\n' "$SENDER" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          REPO_FULL_NAME: ${{ github.repository }}
-          SENDER: ${{ github.actor }}
-
-      - name: Upload preview artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pr-preview
-          path: |
-            dist/
-            pr-metadata.txt
-          retention-days: 1
-
-  # ── PR preview cleanup metadata ──────────────────────────────────────
-  # When a PR is closed or merged, upload a metadata-only artifact so the
-  # privileged deployment workflow can remove the preview directory.
-  preview-cleanup:
-    if: github.event.action == 'closed'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Write cleanup metadata
-        run: |
-          printf 'pr_number=%s\n' "$PR_NUMBER" > "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'pr_action=%s\n' "closed" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'head_sha=%s\n' "$HEAD_SHA" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'head_ref=%s\n' "$HEAD_REF" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'base_ref=%s\n' "$BASE_REF" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'repo_full_name=%s\n' "$REPO_FULL_NAME" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-          printf 'sender=%s\n' "$SENDER" >> "$GITHUB_WORKSPACE/pr-metadata.txt"
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          REPO_FULL_NAME: ${{ github.repository }}
-          SENDER: ${{ github.actor }}
-
-      - name: Upload cleanup artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: pr-preview
-          path: pr-metadata.txt
-          retention-days: 1
