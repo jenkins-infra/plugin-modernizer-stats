@@ -78,24 +78,128 @@ jobs:
             unzip -o pr-preview-build.zip -d dist
           fi
 
-      - name: Read PR metadata
+      - name: Verify PR metadata
         id: pr-info
-        run: |
-          PR_NUMBER="$(cat pr-metadata/pr-number)"
-          PR_ACTION="$(cat pr-metadata/pr-action)"
-          echo "pr-number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "pr-action=${PR_ACTION}" >> "$GITHUB_OUTPUT"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
 
-          if [ -f pr-metadata/pr-head-sha ]; then
-            echo "pr-head-sha=$(cat pr-metadata/pr-head-sha)" >> "$GITHUB_OUTPUT"
-          fi
-          if [ -f pr-metadata/pr-commit-message ]; then
-            # Sanitize commit message to prevent markdown/script injection in PR comments
-            SANITIZED_MSG="$(cat pr-metadata/pr-commit-message | tr -d '|`$' | head -c 200)"
-            echo "pr-commit-message=${SANITIZED_MSG}" >> "$GITHUB_OUTPUT"
-          fi
+            // 1. Read and validate pr-number strictly as a positive integer
+            const prNumFile = path.join(process.env.GITHUB_WORKSPACE, 'pr-metadata', 'pr-number');
+            if (!fs.existsSync(prNumFile)) {
+              core.setFailed('Missing required metadata file: pr-metadata/pr-number');
+              return;
+            }
+            const rawPrNumber = fs.readFileSync(prNumFile, 'utf8').trim();
+            if (!/^[1-9]\d*$/.test(rawPrNumber)) {
+              core.setFailed(`Invalid PR number in metadata: '${rawPrNumber}'. Must be a positive integer.`);
+              return;
+            }
+            const prNumber = Number(rawPrNumber);
+            if (!Number.isSafeInteger(prNumber)) {
+              core.setFailed(`PR number in metadata is not a safe integer: '${rawPrNumber}'`);
+              return;
+            }
 
-          echo "PR #${PR_NUMBER}, action: ${PR_ACTION}"
+            // 2. Read and validate pr-action against allowed values
+            const prActionFile = path.join(process.env.GITHUB_WORKSPACE, 'pr-metadata', 'pr-action');
+            if (!fs.existsSync(prActionFile)) {
+              core.setFailed('Missing required metadata file: pr-metadata/pr-action');
+              return;
+            }
+            const rawAction = fs.readFileSync(prActionFile, 'utf8').trim();
+            const allowedActions = ['deploy', 'closed', 'merged'];
+            if (!allowedActions.includes(rawAction)) {
+              core.setFailed(`Invalid pr-action: '${rawAction}'. Allowed values: ${allowedActions.join(', ')}`);
+              return;
+            }
+
+            // 3. Read optional pr-head-sha and sanitize pr-commit-message
+            let metaHeadSha = '';
+            const shaFile = path.join(process.env.GITHUB_WORKSPACE, 'pr-metadata', 'pr-head-sha');
+            if (fs.existsSync(shaFile)) {
+              metaHeadSha = fs.readFileSync(shaFile, 'utf8').trim();
+            }
+
+            let commitMessage = '';
+            const msgFile = path.join(process.env.GITHUB_WORKSPACE, 'pr-metadata', 'pr-commit-message');
+            if (fs.existsSync(msgFile)) {
+              commitMessage = fs.readFileSync(msgFile, 'utf8').trim();
+            }
+            // Prevent newline, pipe, backtick, or dollar injection in outputs/comments
+            let sanitizedMsg = commitMessage
+              .replace(/[\r\n]+/g, ' ')
+              .replace(/[|`$]/g, '')
+              .trim()
+              .slice(0, 200);
+
+            // 4. Fetch the actual PR from GitHub API and verify state
+            let pr;
+            try {
+              const resp = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              pr = resp.data;
+            } catch (err) {
+              core.setFailed(`Failed to fetch PR #${prNumber} from GitHub API: ${err.message}`);
+              return;
+            }
+
+            // Fallback for commit message if empty
+            if (!sanitizedMsg && pr && pr.title) {
+              sanitizedMsg = pr.title
+                .replace(/[\r\n]+/g, ' ')
+                .replace(/[|`$]/g, '')
+                .trim()
+                .slice(0, 200);
+            }
+
+            // Verify PR base repository targets this repository (fail closed)
+            const expectedRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const baseRepoFullName = pr.base && pr.base.repo && pr.base.repo.full_name;
+            if (!baseRepoFullName || baseRepoFullName !== expectedRepo) {
+              core.setFailed(`PR #${prNumber} base repository is '${baseRepoFullName || 'undefined'}', expected '${expectedRepo}'`);
+              return;
+            }
+
+            let effectiveAction = rawAction;
+
+            // 5. For deploy: verify PR is open and head SHA matches metadata SHA
+            if (rawAction === 'deploy') {
+              if (pr.state !== 'open') {
+                core.info(`PR #${prNumber} is ${pr.state} (not open). Skipping deploy safely.`);
+                effectiveAction = 'skip';
+              } else {
+                if (!metaHeadSha || !/^[0-9a-f]{40}$/i.test(metaHeadSha)) {
+                  core.setFailed(`Invalid or missing head_sha format in metadata: '${metaHeadSha}'`);
+                  return;
+                }
+                if (pr.head.sha !== metaHeadSha) {
+                  core.info(
+                    `Stale preview build: metadata SHA (${metaHeadSha}) does not match current PR head SHA (${pr.head.sha}). Skipping deploy safely.`
+                  );
+                  effectiveAction = 'skip';
+                }
+              }
+            } else if (rawAction === 'closed' || rawAction === 'merged') {
+              // 6. For cleanup: verify PR is actually closed before deleting preview
+              if (pr.state !== 'closed') {
+                core.info(`PR #${prNumber} is currently ${pr.state} (not closed). Skipping cleanup safely.`);
+                effectiveAction = 'skip';
+              }
+            }
+
+            // 7. Safely set outputs for downstream steps (core.setOutput escapes output values)
+            core.setOutput('pr-number', prNumber.toString());
+            core.setOutput('pr-action', effectiveAction);
+            core.setOutput('pr-head-sha', metaHeadSha);
+            core.setOutput('pr-commit-message', sanitizedMsg);
+
+            console.log(`Verified PR #${prNumber}: action='${effectiveAction}', state='${pr.state}', head='${metaHeadSha}'`);
 
       # ──────────────────────────────────────────────────────────────────
       # Deploy or remove preview
@@ -129,7 +233,7 @@ jobs:
             | **Status** | :white_check_mark: Preview deployed successfully! |
             | **Preview URL** | ${{ steps.deploy-preview.outputs.preview-url }} :rocket: |
             | **Commit** | `${{ steps.pr-info.outputs.pr-head-sha }}` |
-            | **Message** | ${{ steps.pr-info.outputs.pr-commit-message }} |
+            | **Message** | `${{ steps.pr-info.outputs.pr-commit-message }}` |
 
             > :hourglass: _This preview is automatically updated on each commit push..._
 

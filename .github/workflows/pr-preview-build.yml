@@ -19,7 +19,6 @@ on:
 permissions:
   contents: read
   pull-requests: read
-  actions: read
 
 concurrency:
   group: >-
@@ -41,117 +40,266 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # ──────────────────────────────────────────────────────────────────
-      # STEP 1: Determine PR number
+      # STEP 1: Determine PR and generate trusted metadata (BEFORE checkout)
       # ──────────────────────────────────────────────────────────────────
-      # FIX for fork PRs: workflow_run.pull_requests[] is ALWAYS empty
-      # for cross-repository (fork) PRs. PR #94 used pulls.list() with
-      # head: "full_name:branch" but full_name = "owner/repo" while the
-      # API expects "owner:branch" — so it never matched fork PRs.
-      #
-      # Enhanced approach:
-      #   1. Try workflow_run.pull_requests[] (works for same-repo PRs)
-      #   2. Fallback: listPullRequestsAssociatedWithCommit() using the
-      #      head_sha — this works for BOTH same-repo AND fork PRs
-      #   3. Last resort: pulls.list() with corrected head format using
-      #      head_repository.owner.login (not full_name)
+      # Security boundary:
+      # PR metadata is derived entirely from GitHub event data and the
+      # GitHub REST API, stored in $RUNNER_TEMP (outside $GITHUB_WORKSPACE),
+      # and uploaded immediately before any untrusted PR code is checked out.
+      # This prevents any PR code from forging metadata or claiming another
+      # PR's preview deployment.
       # ──────────────────────────────────────────────────────────────────
-      - name: Get PR number from workflow run
-        if: github.event_name == 'workflow_run'
+      - name: Generate trusted PR metadata
+        id: pr-info
         uses: actions/github-script@v7
-        id: pr-info-wr
         with:
           script: |
-            const headSha = context.payload.workflow_run.head_sha;
-            const headBranch = context.payload.workflow_run.head_branch;
-            const headRepoFullName = context.payload.workflow_run.head_repository.full_name;
-            const headRepoOwner = context.payload.workflow_run.head_repository.owner.login;
-            const isFork = headRepoFullName !== `${context.repo.owner}/${context.repo.repo}`;
+            const fs = require('fs');
+            const path = require('path');
+            const expectedRepo = `${context.repo.owner}/${context.repo.repo}`;
 
-            console.log(`Head SHA: ${headSha}`);
-            console.log(`Head branch: ${headBranch}`);
-            console.log(`Head repo: ${headRepoFullName}`);
-            console.log(`Is fork PR: ${isFork}`);
+            let prNumber = '';
+            let prAction = '';
+            let headSha = '';
+            let commitMessage = '';
 
-            // Strategy 1: Use workflow_run.pull_requests (only works for same-repo PRs)
-            const prs = context.payload.workflow_run.pull_requests;
-            if (prs && prs.length > 0) {
-              const prNumber = prs[0].number.toString();
-              console.log(`✅ Found PR #${prNumber} from workflow_run.pull_requests`);
-              core.setOutput('pr-number', prNumber);
+            if (context.eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              const baseRepoFullName = pr && pr.base && pr.base.repo && pr.base.repo.full_name;
+              if (!baseRepoFullName || baseRepoFullName !== expectedRepo) {
+                core.setFailed(`PR #${pr ? pr.number : 'unknown'} base repository is '${baseRepoFullName || 'undefined'}', expected '${expectedRepo}'`);
+                return;
+              }
+              prNumber = pr.number.toString();
+              prAction = pr.merged ? 'merged' : 'closed';
+              headSha = pr.head.sha;
+              commitMessage = pr.title || '';
+            } else if (context.eventName === 'workflow_dispatch') {
+              const rawPrNumber = (context.payload.inputs && context.payload.inputs['pr-number']) || '';
+              if (!/^[1-9]\d*$/.test(rawPrNumber)) {
+                core.setFailed(`Invalid PR number input: '${rawPrNumber}'. Must be a positive integer.`);
+                return;
+              }
+              const num = Number(rawPrNumber);
+              let pr;
+              try {
+                const resp = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: num,
+                });
+                pr = resp.data;
+              } catch (err) {
+                core.setFailed(`Failed to fetch PR #${num} for workflow_dispatch: ${err.message}`);
+                return;
+              }
+              const baseRepoFullName = pr.base && pr.base.repo && pr.base.repo.full_name;
+              if (!baseRepoFullName || baseRepoFullName !== expectedRepo) {
+                core.setFailed(`PR #${num} base repository is '${baseRepoFullName || 'undefined'}', expected '${expectedRepo}'`);
+                return;
+              }
+              if (pr.state !== 'open') {
+                core.setFailed(`PR #${num} is ${pr.state}. Only open PRs can be built for preview.`);
+                return;
+              }
+              prNumber = num.toString();
+              prAction = 'deploy';
+              headSha = pr.head.sha;
+              commitMessage = pr.title || '';
+            } else if (context.eventName === 'workflow_run') {
+              const wr = context.payload.workflow_run;
+              if (!wr) {
+                core.setFailed('Missing workflow_run payload in event.');
+                return;
+              }
+              headSha = wr.head_sha || '';
+              const headBranch = wr.head_branch || '';
+              const headRepo = wr.head_repository;
+              const headRepoFullName = headRepo && headRepo.full_name;
+              const headRepoOwner = headRepo && headRepo.owner && headRepo.owner.login;
+
+              if (!headSha || !headBranch || !headRepo || !headRepoFullName || !headRepoOwner) {
+                core.setFailed(
+                  `Incomplete workflow_run event data:\n` +
+                  `  head_sha: '${headSha || 'missing'}'\n` +
+                  `  head_branch: '${headBranch || 'missing'}'\n` +
+                  `  head_repository.full_name: '${headRepoFullName || 'missing'}'\n` +
+                  `  head_repository.owner.login: '${headRepoOwner || 'missing'}'`
+                );
+                return;
+              }
+
+              const isFork = headRepoFullName !== expectedRepo;
+
+              console.log(`Head SHA: ${headSha}`);
+              console.log(`Head branch: ${headBranch}`);
+              console.log(`Head repo: ${headRepoFullName}`);
+              console.log(`Is fork PR: ${isFork}`);
+
+              const candidateMap = new Map();
+              let candidateError = null;
+
+              async function checkAndAddCandidate(num) {
+                if (!Number.isSafeInteger(num) || num <= 0 || candidateMap.has(num) || candidateError) return;
+                try {
+                  const { data: pr } = await github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: num,
+                  });
+                  const baseRepoFullName = pr.base && pr.base.repo && pr.base.repo.full_name;
+                  if (
+                    pr.state === 'open' &&
+                    baseRepoFullName === expectedRepo &&
+                    pr.head &&
+                    pr.head.sha === headSha &&
+                    pr.head.repo &&
+                    pr.head.repo.full_name === headRepoFullName &&
+                    pr.head.ref === headBranch
+                  ) {
+                    candidateMap.set(num, pr);
+                  } else {
+                    console.log(`Candidate PR #${num} rejected: state='${pr.state}', base='${baseRepoFullName || 'undefined'}', head_sha='${pr.head && pr.head.sha}', head_repo='${pr.head && pr.head.repo && pr.head.repo.full_name}', head_ref='${pr.head && pr.head.ref}'`);
+                  }
+                } catch (e) {
+                  candidateError = `Failed to verify candidate PR #${num}: ${e.message}`;
+                }
+              }
+
+              // Strategy 1: workflow_run.pull_requests (works for same-repo PRs)
+              const prs = wr.pull_requests;
+              if (prs && prs.length > 0) {
+                for (const p of prs) {
+                  await checkAndAddCandidate(p.number);
+                  if (candidateError) {
+                    core.setFailed(`❌ Incomplete candidate evaluation: ${candidateError}`);
+                    return;
+                  }
+                }
+              }
+
+              // Strategy 2: commit SHA association (works for same-repo AND fork PRs)
+              try {
+                const commitPRs = await github.paginate(
+                  github.rest.repos.listPullRequestsAssociatedWithCommit,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    commit_sha: headSha,
+                    per_page: 100,
+                  }
+                );
+                for (const p of commitPRs) {
+                  await checkAndAddCandidate(p.number);
+                  if (candidateError) {
+                    core.setFailed(`❌ Incomplete candidate evaluation: ${candidateError}`);
+                    return;
+                  }
+                }
+              } catch (e) {
+                core.setFailed(`❌ Failed to enumerate PRs associated with commit SHA ${headSha}: ${e.message}`);
+                return;
+              }
+
+              // Strategy 3: search by head parameter "owner:branch" (always run to ensure no ambiguity is missed)
+              try {
+                const headParam = `${headRepoOwner}:${headBranch}`;
+                console.log(`Searching PRs with head: ${headParam}`);
+                const branchPRs = await github.paginate(
+                  github.rest.pulls.list,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    head: headParam,
+                    state: 'open',
+                    per_page: 100,
+                  }
+                );
+                for (const p of branchPRs) {
+                  await checkAndAddCandidate(p.number);
+                  if (candidateError) {
+                    core.setFailed(`❌ Incomplete candidate evaluation: ${candidateError}`);
+                    return;
+                  }
+                }
+              } catch (e) {
+                core.setFailed(`❌ Failed to enumerate candidate PRs with head '${headRepoOwner}:${headBranch}': ${e.message}`);
+                return;
+              }
+
+              if (candidateMap.size === 0) {
+                core.setFailed(
+                  `❌ Could not find an open PR matching head SHA ${headSha} and base repo ${expectedRepo}.\n` +
+                  `  Head branch: ${headBranch}\n` +
+                  `  Head repo: ${headRepoFullName}\n` +
+                  `  Is fork: ${isFork}`
+                );
+                return;
+              }
+
+              if (candidateMap.size > 1) {
+                const matched = Array.from(candidateMap.keys()).map(n => `#${n}`).join(', ');
+                core.setFailed(
+                  `❌ Ambiguous match: multiple open PRs (${matched}) match head SHA ${headSha}. Cannot safely determine preview target.`
+                );
+                return;
+              }
+
+              const resolvedPR = Array.from(candidateMap.values())[0];
+              prNumber = resolvedPR.number.toString();
+              prAction = 'deploy';
+              commitMessage = resolvedPR.title || '';
+              console.log(`✅ Verified candidate PR #${prNumber} matches head SHA ${headSha}`);
+            } else {
+              core.setFailed(`Unsupported event: ${context.eventName}`);
               return;
             }
-            console.log('ℹ️  workflow_run.pull_requests is empty (expected for fork PRs)');
 
-            // Strategy 2: Find PR by commit SHA (works for BOTH same-repo AND fork PRs)
-            try {
-              const { data: commitPRs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                commit_sha: headSha,
-              });
-
-              const openPR = commitPRs.find(pr => pr.state === 'open');
-              if (openPR) {
-                const prNumber = openPR.number.toString();
-                console.log(`✅ Found PR #${prNumber} via commit SHA association`);
-                core.setOutput('pr-number', prNumber);
-                return;
+            // Fetch commit message from GitHub REST API if headSha is present
+            if (headSha) {
+              try {
+                const { data: commitData } = await github.rest.repos.getCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: headSha,
+                });
+                if (commitData && commitData.commit && commitData.commit.message) {
+                  commitMessage = commitData.commit.message.split('\n')[0].trim();
+                }
+              } catch (e) {
+                console.log(`repos.getCommit failed: ${e.message}, falling back to PR title`);
               }
-              console.log(`ℹ️  No open PR found for commit SHA ${headSha}`);
-            } catch (error) {
-              console.log(`⚠️  listPullRequestsAssociatedWithCommit failed: ${error.message}`);
             }
 
-            // Strategy 3: Search by head branch with CORRECT format "owner:branch"
-            // BUG FIX: PR #94 used head_repository.full_name ("owner/repo") but
-            // the GitHub API expects just "owner" in the head parameter
-            try {
-              const headParam = `${headRepoOwner}:${headBranch}`;
-              console.log(`Searching PRs with head: ${headParam}`);
+            const sanitizedMsg = commitMessage
+              .replace(/[\r\n]+/g, ' ')
+              .replace(/[|`$]/g, '')
+              .trim()
+              .slice(0, 200);
 
-              const { data: pulls } = await github.rest.pulls.list({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                head: headParam,
-                state: 'open',
-              });
-
-              if (pulls.length > 0) {
-                const prNumber = pulls[0].number.toString();
-                console.log(`✅ Found PR #${prNumber} via pulls.list head search`);
-                core.setOutput('pr-number', prNumber);
-                return;
-              }
-              console.log(`ℹ️  No open PR found with head: ${headParam}`);
-            } catch (error) {
-              console.log(`⚠️  pulls.list search failed: ${error.message}`);
+            // Write metadata outside $GITHUB_WORKSPACE into $RUNNER_TEMP
+            const metaDir = path.join(process.env.RUNNER_TEMP, 'pr-metadata');
+            fs.mkdirSync(metaDir, { recursive: true });
+            fs.writeFileSync(path.join(metaDir, 'pr-number'), prNumber + '\n');
+            fs.writeFileSync(path.join(metaDir, 'pr-action'), prAction + '\n');
+            if (headSha) {
+              fs.writeFileSync(path.join(metaDir, 'pr-head-sha'), headSha + '\n');
             }
+            fs.writeFileSync(path.join(metaDir, 'pr-commit-message'), sanitizedMsg + '\n');
 
-            core.setFailed(
-              `❌ Could not find an open PR for workflow run.\n` +
-              `  Head SHA: ${headSha}\n` +
-              `  Head branch: ${headBranch}\n` +
-              `  Head repo: ${headRepoFullName}\n` +
-              `  Is fork: ${isFork}`
-            );
+            core.setOutput('pr-number', prNumber);
+            core.setOutput('pr-action', prAction);
+            core.setOutput('pr-head-sha', headSha);
+            core.setOutput('pr-commit-message', sanitizedMsg);
 
-      - name: Set PR metadata
-        id: pr-info
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "pr-number=${{ github.event.number }}" >> "$GITHUB_OUTPUT"
-            if [ "${{ github.event.pull_request.merged }}" = "true" ]; then
-              echo "pr-action=merged" >> "$GITHUB_OUTPUT"
-            else
-              echo "pr-action=closed" >> "$GITHUB_OUTPUT"
-            fi
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "pr-number=${{ inputs.pr-number }}" >> "$GITHUB_OUTPUT"
-            echo "pr-action=deploy" >> "$GITHUB_OUTPUT"
-          else
-            echo "pr-number=${{ steps.pr-info-wr.outputs.pr-number }}" >> "$GITHUB_OUTPUT"
-            echo "pr-action=deploy" >> "$GITHUB_OUTPUT"
-          fi
+            console.log(`Sealed metadata: PR #${prNumber}, action='${prAction}', SHA='${headSha}', message='${sanitizedMsg}'`);
+
+      - name: Upload PR metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-metadata
+          path: ${{ runner.temp }}/pr-metadata/
+          if-no-files-found: error
 
       # ──────────────────────────────────────────────────────────────────
       # STEP 2: Build the preview
@@ -164,17 +312,35 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: refs/pull/${{ steps.pr-info.outputs.pr-number }}/head
+          persist-credentials: false
           # Safe to opt in: this workflow has read-only permissions, no
           # secrets are passed to build steps, and the deploy workflow
           # (which has write access) never executes fork-provided code.
           allow-unsafe-pr-checkout: true
+
+      - name: Verify checked-out commit SHA
+        if: steps.pr-info.outputs.pr-action == 'deploy'
+        env:
+          EXPECTED_SHA: ${{ steps.pr-info.outputs.pr-head-sha }}
+        run: |
+          if [ -z "$EXPECTED_SHA" ] || ! echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "::error::Missing or invalid expected PR head SHA: '$EXPECTED_SHA'"
+            exit 1
+          fi
+          EXPECTED_SHA="$(printf '%s' "$EXPECTED_SHA" | tr '[:upper:]' '[:lower:]')"
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "Expected SHA: $EXPECTED_SHA"
+          echo "Actual SHA:   $ACTUAL_SHA"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Checked-out commit SHA ($ACTUAL_SHA) does not match expected PR head SHA ($EXPECTED_SHA)"
+            exit 1
+          fi
 
       - name: Setup Node.js
         if: steps.pr-info.outputs.pr-action == 'deploy'
         uses: actions/setup-node@v7
         with:
           node-version: 26
-          cache: npm
 
       - name: Install dependencies
         if: steps.pr-info.outputs.pr-action == 'deploy'
@@ -189,12 +355,10 @@ jobs:
         run: |
           npx tsc -b
           npx vite build --base /${{ github.event.repository.name }}/pr-preview/pr-${{ steps.pr-info.outputs.pr-number }}/
-          cp dist/index.html dist/404.html
+          node scripts/copy-404.js
 
       # ──────────────────────────────────────────────────────────────────
-      # STEP 3: Upload artifacts for the deploy workflow
-      # Metadata is passed via artifacts (not shell variables) to prevent
-      # injection attacks from fork PR code.
+      # STEP 3: Upload build artifact for the deploy workflow
       # ──────────────────────────────────────────────────────────────────
       - name: Upload build artifact
         if: steps.pr-info.outputs.pr-action == 'deploy'
@@ -202,21 +366,4 @@ jobs:
         with:
           name: pr-preview-build
           path: dist/
-          if-no-files-found: error
-
-      - name: Save PR metadata
-        run: |
-          mkdir -p pr-metadata
-          echo "${{ steps.pr-info.outputs.pr-number }}" > pr-metadata/pr-number
-          echo "${{ steps.pr-info.outputs.pr-action }}" > pr-metadata/pr-action
-          if [ "${{ steps.pr-info.outputs.pr-action }}" = "deploy" ]; then
-            git rev-parse HEAD > pr-metadata/pr-head-sha
-            git log -1 --format='%s' | head -c 200 > pr-metadata/pr-commit-message
-          fi
-
-      - name: Upload PR metadata
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-metadata
-          path: pr-metadata/
           if-no-files-found: error
