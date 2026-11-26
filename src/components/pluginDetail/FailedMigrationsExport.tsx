@@ -51,7 +51,7 @@ export default function FailedMigrationsExport({ pluginName, failCount }: Failed
           {failCount} failed migration{failCount !== 1 ? 's' : ''} available for download
         </Typography>
         {error && (
-          <Typography role="alert" sx={{ fontSize: '0.85rem', color: colors.error.light, mt: 0.5 }}>
+          <Typography role="alert" sx={{ fontSize: '0.85rem', color: colors.text.dark, mt: 0.5 }}>
             Unable to prepare CSV export: {error}
           </Typography>
         )}
