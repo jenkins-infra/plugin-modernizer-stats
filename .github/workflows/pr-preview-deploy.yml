@@ -1,0 +1,278 @@
+name: Deploy PR Preview
+
+on:
+  workflow_run:
+    workflows: ['Build PR Preview']
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: preview-deploy-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-preview:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # ──────────────────────────────────────────────────────────────────
+      # Download artifacts from the build run.
+      # This workflow runs with write permissions but NEVER executes any
+      # code from the PR — it only deploys pre-built static artifacts.
+      # This is the security boundary that makes the workflow_run split
+      # safe for fork PRs.
+      # ──────────────────────────────────────────────────────────────────
+      - name: Download artifacts from build run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = context.payload.workflow_run.id;
+            console.log(`Downloading artifacts from workflow run ${runId}`);
+
+            const { data: { artifacts } } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+
+            console.log(`Found ${artifacts.length} artifact(s):`);
+            artifacts.forEach(a => console.log(`  - ${a.name} (id: ${a.id}, size: ${a.size_in_bytes})`));
+
+            for (const name of ['pr-metadata', 'pr-preview-build']) {
+              const match = artifacts.find(a => a.name === name);
+              if (!match) {
+                if (name === 'pr-preview-build') {
+                  console.log(`Artifact '${name}' not found (may be a closed PR cleanup)`);
+                  continue;
+                }
+                core.setFailed(`Required artifact '${name}' not found in run ${runId}`);
+                return;
+              }
+
+              const download = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: match.id,
+                archive_format: 'zip',
+              });
+
+              const fs = require('fs');
+              fs.writeFileSync(`${process.env.GITHUB_WORKSPACE}/${name}.zip`, Buffer.from(download.data));
+              console.log(`Downloaded ${name}.zip`);
+            }
+
+      - name: Unzip artifacts
+        run: |
+          mkdir -p pr-metadata
+          unzip -o pr-metadata.zip -d pr-metadata
+          if [ -f pr-preview-build.zip ]; then
+            mkdir -p dist
+            unzip -o pr-preview-build.zip -d dist
+          fi
+
+      - name: Verify PR metadata
+        id: pr-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // 1. Read and validate pr-number strictly as a positive integer
+            const prNumFile = path.join(process.env.GITHUB_WORKSPACE, 'pr-metadata', 'pr-number');
+            if (!fs.existsSync(prNumFile)) {
+              core.setFailed('Missing required metadata file: pr-metadata/pr-number');
+              return;
+            }
+            const rawPrNumber = fs.readFileSync(prNumFile, 'utf8').trim();
+            if (!/^[1-9]\d*$/.test(rawPrNumber)) {
+              core.setFailed(`Invalid PR number in metadata: '${rawPrNumber}'. Must be a positive integer.`);
+              return;
+            }
+            const prNumber = Number(rawPrNumber);
+            if (!Number.isSafeInteger(prNumber)) {
+              core.setFailed(`PR number in metadata is not a safe integer: '${rawPrNumber}'`);
+              return;
+            }
+
+            // 2. Read and validate pr-action against allowed values
+            const prActionFile = path.join(process.env.GITHUB_WORKSPACE, 'pr-metadata', 'pr-action');
+            if (!fs.existsSync(prActionFile)) {
+              core.setFailed('Missing required metadata file: pr-metadata/pr-action');
+              return;
+            }
+            const rawAction = fs.readFileSync(prActionFile, 'utf8').trim();
+            const allowedActions = ['deploy', 'closed', 'merged'];
+            if (!allowedActions.includes(rawAction)) {
+              core.setFailed(`Invalid pr-action: '${rawAction}'. Allowed values: ${allowedActions.join(', ')}`);
+              return;
+            }
+
+            // 3. Read optional pr-head-sha and sanitize pr-commit-message
+            let metaHeadSha = '';
+            const shaFile = path.join(process.env.GITHUB_WORKSPACE, 'pr-metadata', 'pr-head-sha');
+            if (fs.existsSync(shaFile)) {
+              metaHeadSha = fs.readFileSync(shaFile, 'utf8').trim();
+            }
+
+            let commitMessage = '';
+            const msgFile = path.join(process.env.GITHUB_WORKSPACE, 'pr-metadata', 'pr-commit-message');
+            if (fs.existsSync(msgFile)) {
+              commitMessage = fs.readFileSync(msgFile, 'utf8').trim();
+            }
+            // Prevent newline, pipe, backtick, or dollar injection in outputs/comments
+            let sanitizedMsg = commitMessage
+              .replace(/[\r\n]+/g, ' ')
+              .replace(/[|`$]/g, '')
+              .trim()
+              .slice(0, 200);
+
+            // 4. Fetch the actual PR from GitHub API and verify state
+            let pr;
+            try {
+              const resp = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              pr = resp.data;
+            } catch (err) {
+              core.setFailed(`Failed to fetch PR #${prNumber} from GitHub API: ${err.message}`);
+              return;
+            }
+
+            // Fallback for commit message if empty
+            if (!sanitizedMsg && pr && pr.title) {
+              sanitizedMsg = pr.title
+                .replace(/[\r\n]+/g, ' ')
+                .replace(/[|`$]/g, '')
+                .trim()
+                .slice(0, 200);
+            }
+
+            // Verify PR base repository targets this repository (fail closed)
+            const expectedRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const baseRepoFullName = pr.base && pr.base.repo && pr.base.repo.full_name;
+            if (!baseRepoFullName || baseRepoFullName !== expectedRepo) {
+              core.setFailed(`PR #${prNumber} base repository is '${baseRepoFullName || 'undefined'}', expected '${expectedRepo}'`);
+              return;
+            }
+
+            let effectiveAction = rawAction;
+
+            // 5. For deploy: verify PR is open and head SHA matches metadata SHA
+            if (rawAction === 'deploy') {
+              if (pr.state !== 'open') {
+                core.info(`PR #${prNumber} is ${pr.state} (not open). Skipping deploy safely.`);
+                effectiveAction = 'skip';
+              } else {
+                if (!metaHeadSha || !/^[0-9a-f]{40}$/i.test(metaHeadSha)) {
+                  core.setFailed(`Invalid or missing head_sha format in metadata: '${metaHeadSha}'`);
+                  return;
+                }
+                if (pr.head.sha !== metaHeadSha) {
+                  core.info(
+                    `Stale preview build: metadata SHA (${metaHeadSha}) does not match current PR head SHA (${pr.head.sha}). Skipping deploy safely.`
+                  );
+                  effectiveAction = 'skip';
+                }
+              }
+            } else if (rawAction === 'closed' || rawAction === 'merged') {
+              // 6. For cleanup: verify PR is actually closed before deleting preview
+              if (pr.state !== 'closed') {
+                core.info(`PR #${prNumber} is currently ${pr.state} (not closed). Skipping cleanup safely.`);
+                effectiveAction = 'skip';
+              }
+            }
+
+            // 7. Safely set outputs for downstream steps (core.setOutput escapes output values)
+            core.setOutput('pr-number', prNumber.toString());
+            core.setOutput('pr-action', effectiveAction);
+            core.setOutput('pr-head-sha', metaHeadSha);
+            core.setOutput('pr-commit-message', sanitizedMsg);
+
+            console.log(`Verified PR #${prNumber}: action='${effectiveAction}', state='${pr.state}', head='${metaHeadSha}'`);
+
+      # ──────────────────────────────────────────────────────────────────
+      # Deploy or remove preview
+      # ──────────────────────────────────────────────────────────────────
+      - name: Deploy preview
+        if: steps.pr-info.outputs.pr-action == 'deploy'
+        id: deploy-preview
+        uses: rossjrw/pr-preview-action@873417d2df72380da1f3978378fb58560bcde976 # v1.8.2
+        with:
+          source-dir: ./dist/
+          preview-branch: gh-pages
+          umbrella-dir: pr-preview
+          pr-number: ${{ steps.pr-info.outputs.pr-number }}
+          action: deploy
+          comment: false
+
+      # Workaround: pr-preview-action's built-in comment does not work under
+      # workflow_run because it never forwards pr-number to sticky-pull-request-comment.
+      # See: https://github.com/rossjrw/pr-preview-action/pull/131
+      - name: Comment preview URL on PR
+        if: steps.pr-info.outputs.pr-action == 'deploy'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: pr-preview
+          number: ${{ steps.pr-info.outputs.pr-number }}
+          message: |
+            <table><tr><td>========================================</td></tr><tr><td><img src="https://www.jenkins.io/images/logos/jenkins/jenkins.svg" width="17" alt="Jenkins"> <strong>PR Preview => Plugin Modernizer Stats</strong></td></tr><tr><td>========================================</td></tr></table>
+
+            | | |
+            | :--- | :--- |
+            | **Status** | :white_check_mark: Preview deployed successfully! |
+            | **Preview URL** | ${{ steps.deploy-preview.outputs.preview-url }} :rocket: |
+            | **Commit** | `${{ steps.pr-info.outputs.pr-head-sha }}` |
+            | **Message** | `${{ steps.pr-info.outputs.pr-commit-message }}` |
+
+            > :hourglass: _This preview is automatically updated on each commit push..._
+
+      - name: Remove preview
+        if: ${{ steps.pr-info.outputs.pr-action == 'merged' || steps.pr-info.outputs.pr-action == 'closed' }}
+        uses: rossjrw/pr-preview-action@873417d2df72380da1f3978378fb58560bcde976 # v1.8.2
+        with:
+          preview-branch: gh-pages
+          umbrella-dir: pr-preview
+          pr-number: ${{ steps.pr-info.outputs.pr-number }}
+          action: remove
+          comment: false
+
+      - name: Comment preview removed (PR merged)
+        if: steps.pr-info.outputs.pr-action == 'merged'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: pr-preview
+          number: ${{ steps.pr-info.outputs.pr-number }}
+          message: |
+            <table><tr><td>========================================</td></tr><tr><td><img src="https://www.jenkins.io/images/logos/jenkins/jenkins.svg" width="17" alt="Jenkins"> <strong>PR Preview => Plugin Modernizer Stats</strong></td></tr><tr><td>========================================</td></tr></table>
+
+            | | |
+            | :--- | :--- |
+            | **Status** | :purple_heart: Preview removed — PR merged successfully! |
+
+            > :tada: _Changes are now live on the production site._
+
+      - name: Comment preview removed (PR closed)
+        if: steps.pr-info.outputs.pr-action == 'closed'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: pr-preview
+          number: ${{ steps.pr-info.outputs.pr-number }}
+          message: |
+            <table><tr><td>========================================</td></tr><tr><td><img src="https://www.jenkins.io/images/logos/jenkins/jenkins.svg" width="17" alt="Jenkins"> <strong>PR Preview => Plugin Modernizer Stats</strong></td></tr><tr><td>========================================</td></tr></table>
+
+            | | |
+            | :--- | :--- |
+            | **Status** | :wastebasket: Preview removed |
+
+            > :wastebasket: _The preview for this PR has been cleaned up because the pull request was closed without merging._
