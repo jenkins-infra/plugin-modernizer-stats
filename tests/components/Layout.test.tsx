@@ -3,6 +3,8 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import Layout from '../../src/components/Layout';
 
+const NAV_LABELS = ['Dashboard', 'Plugins', 'Recipes'] as const;
+
 function mockDesktopViewport(isDesktop: boolean) {
   window.matchMedia = (query: string) =>
     ({
@@ -50,93 +52,35 @@ describe('Layout navigation and accessibility', () => {
     expect(screen.getByRole('link', { name: 'Recipes' }).getAttribute('href')).toBe('/recipes');
   });
 
-  it('marks only Dashboard as active on the root route', () => {
-    renderLayout('/');
+  it.each([
+    { path: '/', activeLabel: 'Dashboard', expectedAriaCurrent: 'page' },
+    { path: '/plugins', activeLabel: 'Plugins', expectedAriaCurrent: 'page' },
+    { path: '/recipes', activeLabel: 'Recipes', expectedAriaCurrent: 'page' },
+    { path: '/plugins/git-client', activeLabel: 'Plugins', expectedAriaCurrent: 'true' },
+    {
+      path: '/recipes/io.jenkins.tools.pluginmodernizer.SetupJenkinsfile',
+      activeLabel: 'Recipes',
+      expectedAriaCurrent: 'true',
+    },
+    { path: '/unknown-page', activeLabel: null, expectedAriaCurrent: null },
+    { path: '/plugins-extra', activeLabel: null, expectedAriaCurrent: null },
+  ])(
+    'sets active class and aria-current=$expectedAriaCurrent on $path',
+    ({ path, activeLabel, expectedAriaCurrent }) => {
+      renderLayout(path);
 
-    const dashboard = screen.getByRole('link', { name: 'Dashboard' });
-    const plugins = screen.getByRole('link', { name: 'Plugins' });
-    const recipes = screen.getByRole('link', { name: 'Recipes' });
-
-    expect(dashboard.getAttribute('aria-current')).toBe('page');
-    expect(dashboard.className).toContain('Mui-selected');
-    expect(plugins.getAttribute('aria-current')).toBeNull();
-    expect(plugins.className).not.toContain('Mui-selected');
-    expect(recipes.getAttribute('aria-current')).toBeNull();
-    expect(recipes.className).not.toContain('Mui-selected');
-  });
-
-  it('marks only Plugins as active on /plugins', () => {
-    renderLayout('/plugins');
-
-    const dashboard = screen.getByRole('link', { name: 'Dashboard' });
-    const plugins = screen.getByRole('link', { name: 'Plugins' });
-    const recipes = screen.getByRole('link', { name: 'Recipes' });
-
-    expect(plugins.getAttribute('aria-current')).toBe('page');
-    expect(plugins.className).toContain('Mui-selected');
-    expect(dashboard.getAttribute('aria-current')).toBeNull();
-    expect(recipes.getAttribute('aria-current')).toBeNull();
-  });
-
-  it('marks only Recipes as active on /recipes', () => {
-    renderLayout('/recipes');
-
-    const dashboard = screen.getByRole('link', { name: 'Dashboard' });
-    const plugins = screen.getByRole('link', { name: 'Plugins' });
-    const recipes = screen.getByRole('link', { name: 'Recipes' });
-
-    expect(recipes.getAttribute('aria-current')).toBe('page');
-    expect(recipes.className).toContain('Mui-selected');
-    expect(dashboard.getAttribute('aria-current')).toBeNull();
-    expect(plugins.getAttribute('aria-current')).toBeNull();
-  });
-
-  it('highlights Plugins and sets aria-current="page" on nested plugin detail routes', () => {
-    renderLayout('/plugins/git-client');
-
-    const dashboard = screen.getByRole('link', { name: 'Dashboard' });
-    const plugins = screen.getByRole('link', { name: 'Plugins' });
-    const recipes = screen.getByRole('link', { name: 'Recipes' });
-
-    expect(plugins.getAttribute('aria-current')).toBe('page');
-    expect(plugins.className).toContain('Mui-selected');
-    expect(dashboard.getAttribute('aria-current')).toBeNull();
-    expect(dashboard.className).not.toContain('Mui-selected');
-    expect(recipes.getAttribute('aria-current')).toBeNull();
-    expect(recipes.className).not.toContain('Mui-selected');
-  });
-
-  it('highlights Recipes and sets aria-current="page" on nested recipe detail routes', () => {
-    renderLayout('/recipes/io.jenkins.tools.pluginmodernizer.SetupJenkinsfile');
-
-    const dashboard = screen.getByRole('link', { name: 'Dashboard' });
-    const plugins = screen.getByRole('link', { name: 'Plugins' });
-    const recipes = screen.getByRole('link', { name: 'Recipes' });
-
-    expect(recipes.getAttribute('aria-current')).toBe('page');
-    expect(recipes.className).toContain('Mui-selected');
-    expect(dashboard.getAttribute('aria-current')).toBeNull();
-    expect(plugins.getAttribute('aria-current')).toBeNull();
-  });
-
-  it('does not activate any navigation item on unknown or prefix-colliding routes', () => {
-    const { unmount } = renderLayout('/unknown-page');
-
-    for (const label of ['Dashboard', 'Plugins', 'Recipes']) {
-      const link = screen.getByRole('link', { name: label });
-      expect(link.getAttribute('aria-current')).toBeNull();
-      expect(link.className).not.toContain('Mui-selected');
+      for (const label of NAV_LABELS) {
+        const link = screen.getByRole('link', { name: label });
+        if (label === activeLabel) {
+          expect(link.getAttribute('aria-current')).toBe(expectedAriaCurrent);
+          expect(link.classList.contains('active')).toBe(true);
+        } else {
+          expect(link.getAttribute('aria-current')).toBeNull();
+          expect(link.classList.contains('active')).toBe(false);
+        }
+      }
     }
-
-    unmount();
-
-    renderLayout('/plugins-extra');
-    for (const label of ['Dashboard', 'Plugins', 'Recipes']) {
-      const link = screen.getByRole('link', { name: label });
-      expect(link.getAttribute('aria-current')).toBeNull();
-      expect(link.className).not.toContain('Mui-selected');
-    }
-  });
+  );
 
   it('navigates between pages and updates active state when clicking sidebar links', () => {
     renderLayout('/');

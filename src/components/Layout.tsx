@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react';
-import { NavLink, matchPath, useLocation } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import Box from '@mui/material/Box';
 import Drawer from '@mui/material/Drawer';
 import List from '@mui/material/List';
@@ -76,23 +76,31 @@ export default function Layout({ children }: { children: ReactNode }) {
       >
         {navItems.map((item) => {
           const isIndex = item.path === '/';
-          const active = matchPath({ path: item.path, end: isIndex }, location.pathname) !== null;
+          const normalizedPath = location.pathname.replace(/\/+$/, '') || '/';
+          const isExactMatch = normalizedPath === item.path;
           return (
             <ListItemButton
               key={item.path}
               component={NavLink}
               to={item.path}
               end={isIndex}
-              selected={active}
+              aria-current={isExactMatch ? 'page' : 'true'}
               onClick={handleNavClick}
               sx={{
                 mx: 1,
                 borderRadius: 1,
                 mb: 0.5,
-                color: active ? 'common.white' : 'text.secondary',
-                bgcolor: active ? 'primary.main' : 'transparent',
+                color: 'text.secondary',
+                bgcolor: 'transparent',
                 '&:hover': {
-                  bgcolor: active ? 'primary.dark' : 'action.hover',
+                  bgcolor: 'action.hover',
+                },
+                '&.active': {
+                  color: 'common.white',
+                  bgcolor: 'primary.main',
+                  '&:hover': {
+                    bgcolor: 'primary.dark',
+                  },
                 },
               }}
             >
