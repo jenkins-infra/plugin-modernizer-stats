@@ -39,4 +39,16 @@ describe('RecipeRateCards', () => {
     expect(onChange).toHaveBeenCalledWith('all');
     console.log(`  RecipeRateCards : clicking active "High Rate" resets to "all"`);
   });
+
+  it('exposes aria-pressed matching the active tier filter', () => {
+    render(<RecipeRateCards tierCounts={tierCounts} activeFilter="high" onFilterChange={() => {}} />);
+
+    const highBtn = screen.getByText('High Rate').closest('button');
+    const mediumBtn = screen.getByText('Medium Rate').closest('button');
+    const lowBtn = screen.getByText('Low Rate').closest('button');
+
+    expect(highBtn?.getAttribute('aria-pressed')).toBe('true');
+    expect(mediumBtn?.getAttribute('aria-pressed')).toBe('false');
+    expect(lowBtn?.getAttribute('aria-pressed')).toBe('false');
+  });
 });

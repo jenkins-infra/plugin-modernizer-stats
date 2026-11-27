@@ -15,10 +15,12 @@ interface StatCardProps {
 
 export default function StatCard({ value, label, description, icon, color, onClick, active }: StatCardProps) {
   const isClickable = !!onClick;
+  const isToggle = isClickable && active !== undefined;
   return (
     <Box
       component={isClickable ? 'button' : 'div'}
       type={isClickable ? 'button' : undefined}
+      aria-pressed={isToggle ? active : undefined}
       onClick={onClick}
       sx={{
         all: isClickable ? 'unset' : undefined,
