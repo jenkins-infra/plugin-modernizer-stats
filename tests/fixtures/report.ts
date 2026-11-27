@@ -32,6 +32,7 @@ export const mockReport: ReportJson = {
     source_sha256: 'fixture-sha256',
     parsed_at: '2025-09-03T10:00:00Z',
   },
+  // Hand-maintained aggregate totals — keep in sync with `plugins` below when editing this fixture.
   overview: {
     totalPlugins: 9,
     totalMigrations: 16,

@@ -2,9 +2,9 @@ import { useMemo, useState } from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import { useAllPlugins } from '../hooks/useMetadata';
-import { countByStatus, deriveStatus } from '../util/pluginStatus';
+import { deriveStatus } from '../util/pluginStatus';
 import { colors } from '../theme';
-import type { PluginStatusColor } from '../types';
+import type { PluginReport, PluginStatusColor } from '../types';
 import { SkeletonList } from '../components/common/Skeleton';
 import ErrorBanner from '../components/common/ErrorBanner';
 import PluginStatusCards from '../components/pluginList/PluginStatusCards';
@@ -12,6 +12,14 @@ import PluginSearchBar from '../components/pluginList/PluginSearchBar';
 import PluginVirtualList from '../components/pluginList/PluginVirtualList';
 
 type FilterKey = 'all' | PluginStatusColor;
+
+function countByStatus(plugins: PluginReport[]) {
+  const counts = { green: 0, red: 0, blue: 0, yellow: 0, white: 0 };
+  for (const p of plugins) {
+    counts[deriveStatus(p.migrations)]++;
+  }
+  return counts;
+}
 
 export default function PluginList() {
   const { data: plugins, error, loading } = useAllPlugins();
