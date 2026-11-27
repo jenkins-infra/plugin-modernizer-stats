@@ -1,38 +1,37 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReportJson } from '../../src/types';
-
-const REPORT_URL = 'https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json';
+import { mockReport } from '../fixtures/report';
 
 /**
- * Integration tests that fetch the real report.json and validate
- * RecipeDetail page data flows correctly through dataClient.
+ * Integration tests that validate RecipeDetail page data flows
+ * correctly through dataClient using a deterministic report.json fixture.
  */
-describe('RecipeDetail integration (real report.json)', () => {
-  let realReport: ReportJson;
+describe('RecipeDetail integration (report.json fixture)', () => {
+  let report: ReportJson;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     vi.resetModules();
     vi.restoreAllMocks();
 
-    const res = await fetch(REPORT_URL);
-    if (!res.ok) {
-      throw new Error(`Failed to fetch report.json: HTTP ${res.status} ${res.statusText}`);
-    }
-    realReport = (await res.json()) as ReportJson;
+    report = mockReport;
 
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
         ok: true,
-        json: () => Promise.resolve(realReport),
+        json: () => Promise.resolve(report),
       })
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('getRecipe returns consistent data for all recipes', async () => {
     const { dataClient } = await import('../../src/lib/dataClient');
 
-    for (const [recipeId, rawRecipe] of Object.entries(realReport.recipes)) {
+    for (const [recipeId, rawRecipe] of Object.entries(report.recipes)) {
       const result = await dataClient.getRecipe(recipeId);
       expect(result.ok).toBe(true);
       if (!result.ok) continue;
@@ -44,7 +43,7 @@ describe('RecipeDetail integration (real report.json)', () => {
       expect(result.data.plugins).toHaveLength(rawRecipe.plugins.length);
     }
 
-    console.log(`  RecipeDetail integration : validated ${Object.keys(realReport.recipes).length} recipes`);
+    console.log(`  RecipeDetail integration : validated ${Object.keys(report.recipes).length} recipes`);
   });
 
   it('getRecipe returns not-found error for invalid recipe ID', async () => {
@@ -60,7 +59,7 @@ describe('RecipeDetail integration (real report.json)', () => {
   it('success + failure counts are within totalApplications for all recipes', async () => {
     const { dataClient } = await import('../../src/lib/dataClient');
 
-    for (const recipeId of Object.keys(realReport.recipes)) {
+    for (const recipeId of Object.keys(report.recipes)) {
       const result = await dataClient.getRecipe(recipeId);
       expect(result.ok).toBe(true);
       if (!result.ok) continue;
@@ -76,7 +75,7 @@ describe('RecipeDetail integration (real report.json)', () => {
     const { dataClient } = await import('../../src/lib/dataClient');
     const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/;
 
-    const recipeId = Object.keys(realReport.recipes).find((id) => realReport.recipes[id].plugins.length > 0);
+    const recipeId = Object.keys(report.recipes).find((id) => report.recipes[id].plugins.length > 0);
     expect(recipeId).toBeDefined();
 
     const result = await dataClient.getRecipe(recipeId!);

@@ -1,29 +1,31 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReportJson } from '../../src/types';
-
-const REPORT_URL = 'https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json';
+import { mockReport } from '../fixtures/report';
 
 /**
- * These tests fetch the real report.json, feed it to dataClient via mocked fetch
+ * These tests feed a deterministic report.json fixture to dataClient via mocked fetch
  * and validate that dataClient produces correct results matching the raw data.
  */
-describe('dataClient validated against actual report.json', () => {
-  let realReport: ReportJson;
+describe('dataClient validated against report.json fixture', () => {
+  let report: ReportJson;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     vi.resetModules();
     vi.restoreAllMocks();
 
-    const res = await fetch(REPORT_URL);
-    realReport = (await res.json()) as ReportJson;
+    report = mockReport;
 
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
         ok: true,
-        json: () => Promise.resolve(realReport),
+        json: () => Promise.resolve(report),
       })
     );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('getAllPlugins total migrations matches report.overview.totalMigrations', async () => {
@@ -36,15 +38,15 @@ describe('dataClient validated against actual report.json', () => {
     const totalFromClient = result.data.reduce((sum, p) => sum + p.totalMigrations, 0);
 
     let totalFromJson = 0;
-    for (const p of Object.values(realReport.plugins)) {
+    for (const p of Object.values(report.plugins)) {
       totalFromJson += p.aggregatedMigrations.length;
     }
 
     expect(totalFromClient).toBe(totalFromJson);
-    expect(totalFromClient).toBe(realReport.overview.totalMigrations);
+    expect(totalFromClient).toBe(report.overview.totalMigrations);
     console.log(`  dataClient : ${result.data.length} plugins, ${totalFromClient} migrations`);
     console.log(
-      `  report.json: ${Object.keys(realReport.plugins).length} plugins, ${totalFromJson} migrations (overview: ${realReport.overview.totalMigrations})`
+      `  report.json: ${Object.keys(report.plugins).length} plugins, ${totalFromJson} migrations (overview: ${report.overview.totalMigrations})`
     );
   });
 
@@ -60,7 +62,7 @@ describe('dataClient validated against actual report.json', () => {
 
     let jsonSuccess = 0;
     let jsonFail = 0;
-    for (const p of Object.values(realReport.plugins)) {
+    for (const p of Object.values(report.plugins)) {
       for (const m of p.aggregatedMigrations) {
         if (m.migrationStatus === 'success') jsonSuccess++;
         else if (m.migrationStatus === 'fail') jsonFail++;
@@ -71,15 +73,15 @@ describe('dataClient validated against actual report.json', () => {
     expect(clientFail).toBe(jsonFail);
     console.log(`  dataClient : success=${clientSuccess}, fail=${clientFail}`);
     console.log(
-      `  report.json: success=${jsonSuccess}, fail=${jsonFail} (overview: ${realReport.overview.successfulMigrations}s/${realReport.overview.failedMigrations}f)`
+      `  report.json: success=${jsonSuccess}, fail=${jsonFail} (overview: ${report.overview.successfulMigrations}s/${report.overview.failedMigrations}f)`
     );
   });
 
   it('getPluginReport returns correct data for a known mixed plugin', async () => {
     const { dataClient } = await import('../../src/lib/dataClient');
 
-    const pluginId = Object.keys(realReport.plugins).find((id) => {
-      const agg = realReport.plugins[id].aggregatedMigrations;
+    const pluginId = Object.keys(report.plugins).find((id) => {
+      const agg = report.plugins[id].aggregatedMigrations;
       const s = agg.filter((m) => m.migrationStatus === 'success').length;
       const f = agg.filter((m) => m.migrationStatus === 'fail').length;
       return s > 0 && f > 0;
@@ -90,14 +92,14 @@ describe('dataClient validated against actual report.json', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    const rawAgg = realReport.plugins[pluginId!].aggregatedMigrations;
+    const rawAgg = report.plugins[pluginId!].aggregatedMigrations;
     const expectedSuccess = rawAgg.filter((m) => m.migrationStatus === 'success').length;
     const expectedFail = rawAgg.filter((m) => m.migrationStatus === 'fail').length;
 
     expect(result.data.totalMigrations).toBe(rawAgg.length);
     expect(result.data.successCount).toBe(expectedSuccess);
     expect(result.data.failCount).toBe(expectedFail);
-    expect(result.data.pluginRepository).toBe(realReport.plugins[pluginId!].sourceUrls?.repository ?? '');
+    expect(result.data.pluginRepository).toBe(report.plugins[pluginId!].sourceUrls?.repository ?? '');
     console.log(
       `  dataClient : ${pluginId} -> ${result.data.totalMigrations} migrations, ${result.data.successCount}s/${result.data.failCount}f`
     );
@@ -110,12 +112,12 @@ describe('dataClient validated against actual report.json', () => {
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.data.overview).toEqual(realReport.overview);
+    expect(result.data.overview).toEqual(report.overview);
     console.log(
       `  dataClient : totalPlugins=${result.data.overview.totalPlugins}, totalMigrations=${result.data.overview.totalMigrations}, successRate=${result.data.overview.successRate}%`
     );
     console.log(
-      `  report.json: totalPlugins=${realReport.overview.totalPlugins}, totalMigrations=${realReport.overview.totalMigrations}, successRate=${realReport.overview.successRate}%`
+      `  report.json: totalPlugins=${report.overview.totalPlugins}, totalMigrations=${report.overview.totalMigrations}, successRate=${report.overview.successRate}%`
     );
   });
 
@@ -126,7 +128,7 @@ describe('dataClient validated against actual report.json', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    const expectedCount = Object.keys(realReport.recipes).length;
+    const expectedCount = Object.keys(report.recipes).length;
     expect(result.data).toHaveLength(expectedCount);
     console.log(`  dataClient : ${result.data.length} recipes`);
     console.log(`  report.json: ${expectedCount} recipes`);
@@ -140,7 +142,7 @@ describe('dataClient validated against actual report.json', () => {
     if (!result.ok) return;
 
     for (const recipe of result.data) {
-      const raw = realReport.recipes[recipe.recipeId];
+      const raw = report.recipes[recipe.recipeId];
       expect(raw).toBeDefined();
       expect(recipe.totalApplications).toBe(raw.totalApplications);
       expect(recipe.successCount).toBe(raw.successCount);
@@ -159,8 +161,8 @@ describe('dataClient validated against actual report.json', () => {
   it('getRecipe returns correct data for a known recipe with plugins', async () => {
     const { dataClient } = await import('../../src/lib/dataClient');
 
-    const recipeId = Object.keys(realReport.recipes).find((id) => {
-      const r = realReport.recipes[id];
+    const recipeId = Object.keys(report.recipes).find((id) => {
+      const r = report.recipes[id];
       return r.plugins && r.plugins.length > 0 && r.successCount > 0;
     });
     expect(recipeId).toBeDefined();
@@ -169,7 +171,7 @@ describe('dataClient validated against actual report.json', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    const raw = realReport.recipes[recipeId!];
+    const raw = report.recipes[recipeId!];
     expect(result.data.recipeId).toBe(raw.recipeId);
     expect(result.data.totalApplications).toBe(raw.totalApplications);
     expect(result.data.successCount).toBe(raw.successCount);
@@ -186,7 +188,7 @@ describe('dataClient validated against actual report.json', () => {
   it('getRecipe plugin statuses are valid values', async () => {
     const { dataClient } = await import('../../src/lib/dataClient');
 
-    const recipeIds = Object.keys(realReport.recipes);
+    const recipeIds = Object.keys(report.recipes);
     let totalPluginEntries = 0;
     const statusSet = new Set<string>();
 
@@ -212,11 +214,49 @@ describe('dataClient validated against actual report.json', () => {
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.data.plugins).toHaveLength(Object.keys(realReport.plugins).length);
-    expect(result.data.recipes).toHaveLength(Object.keys(realReport.recipes).length);
+    expect(result.data.plugins).toHaveLength(Object.keys(report.plugins).length);
+    expect(result.data.recipes).toHaveLength(Object.keys(report.recipes).length);
     console.log(`  dataClient : ${result.data.plugins.length} plugins, ${result.data.recipes.length} recipes`);
     console.log(
-      `  report.json: ${Object.keys(realReport.plugins).length} plugins, ${Object.keys(realReport.recipes).length} recipes`
+      `  report.json: ${Object.keys(report.plugins).length} plugins, ${Object.keys(report.recipes).length} recipes`
     );
+  });
+});
+
+const LIVE_REPORT_URL = 'https://jenkins-infra.github.io/metadata-plugin-modernizer/report.json';
+
+describe.skipIf(!process.env.LIVE_REPORT)('dataClient live report.json smoke test', { timeout: 30000 }, () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('parses the live upstream report.json schema', async () => {
+    const res = await fetch(LIVE_REPORT_URL);
+    expect(res.ok).toBe(true);
+    const liveReport = (await res.json()) as ReportJson;
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve(liveReport),
+      })
+    );
+
+    const { dataClient } = await import('../../src/lib/dataClient');
+    const [summary, plugins, recipes] = await Promise.all([
+      dataClient.getSummary(),
+      dataClient.getAllPlugins(),
+      dataClient.getAllRecipes(),
+    ]);
+
+    expect(summary.ok).toBe(true);
+    expect(plugins.ok).toBe(true);
+    expect(recipes.ok).toBe(true);
   });
 });
